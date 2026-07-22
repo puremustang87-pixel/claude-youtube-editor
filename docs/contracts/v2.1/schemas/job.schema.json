@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workbench/job.schema.json",
+  "title": "Job v2.1 — videos/<project>/work/jobs/<job_id>.json is the source of truth",
+  "type": "object",
+  "required": ["job_id", "kind", "state", "created_at", "updated_at"],
+  "properties": {
+    "job_id": { "type": "string", "pattern": "^job_[A-Za-z0-9]{8,32}$" },
+    "kind": { "enum": ["generate", "render", "bake", "ingest"] },
+    "project": { "type": "string", "description": "videos/<project>" },
+    "scene_uid": { "type": "string" },
+    "range": { "type": "object", "properties": { "from_s": { "type": "number" }, "to_s": { "type": "number" } }, "description": "for kind=bake range jobs" },
+    "requested_take_uid": { "type": "string", "description": "take this job intends to produce (pre-allocated)" },
+    "provider": { "enum": ["remotion", "fable", "hyperframe", "media"] },
+    "spec": { "type": "object" },
+    "input_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$", "description": "hash of spec + input manifest — the immutable input snapshot" },
+
+    "state": {
+      "enum": ["queued", "submitted", "running", "awaiting_pick", "succeeded", "failed", "canceled", "orphaned", "unknown"],
+      "description": "orphaned: start_token no longer matches a live process after restart. unknown: live PID but unverifiable token. Both are terminal until human action or retry; NEVER silently running."
+    },
+    "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+    "message": { "type": "string" },
+
+    "attempt": { "type": "integer", "minimum": 1 },
+    "max_attempts": { "type": "integer", "default": 2 },
+    "parent_job_id": { "type": ["string", "null"], "description": "retry lineage: each attempt is a separate record" },
+    "lineage_root": { "type": ["string", "null"], "description": "job_id of the first attempt in this lineage" },
+
+    "pid": { "type": ["integer", "null"] },
+    "start_token": { "type": ["string", "null"], "description": "pid + process start-time token for restart reconciliation" },
+    "provider_job_id": { "type": ["string", "null"], "description": "remote job identity where provider-spawned" },
+
+    "output_dir": { "type": "string", "description": "per-job output directory — no shared output paths between jobs" },
+    "expected_artifacts": { "type": "array", "items": { "type": "string" } },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object", "required": ["file", "sha256"],
+        "properties": { "file": { "type": "string" }, "sha256": { "type": "string" }, "picked": { "type": "boolean", "default": false } }
+      }
+    },
+
+    "exit_code": { "type": ["integer", "null"] },
+    "error": { "type": ["object", "null"], "properties": { "code": { "type": "string" }, "message": { "type": "string" } } },
+    "cost_usd": { "type": ["number", "null"] },
+    "moderation": { "type": ["string", "null"] },
+
+    "created_at": { "type": "string", "format": "date-time" },
+    "started_at": { "type": ["string", "null"], "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": ["string", "null"], "format": "date-time" }
+  }
+}

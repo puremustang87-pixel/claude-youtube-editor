@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workbench/scene.schema.json",
+  "title": "Scene (timeline.json shots[] entry, v2 — additive over the v1 bake contract)",
+  "type": "object",
+  "required": ["id", "type", "master_in_s", "master_out_s"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9-]*$", "description": "Stable scene identity. PascalCase for Remotion comps." },
+    "type": { "enum": ["cutaway", "overlay"], "description": "v1 bake contract" },
+    "master_in_s": { "type": "number", "minimum": 0 },
+    "master_out_s": { "type": "number", "exclusiveMinimum": 0 },
+    "cue": { "type": "string", "description": "v1: narration cue this scene lands on" },
+    "asset": { "type": "string", "description": "v1 bake contract. DERIVED: always equals versions[active].file. Never hand-edited once versions exist." },
+    "enabled": { "type": "boolean", "default": true, "description": "v1: disabled scenes stay in the plan, bake skips them" },
+
+    "engine": { "enum": ["remotion", "fable", "hyperframe", "media"], "default": "remotion" },
+    "status": { "enum": ["planned", "generating", "draft", "approved"], "default": "planned" },
+    "z": { "type": "integer", "default": 0, "description": "overlays only: stacking order, low renders first" },
+    "transition_in": {
+      "type": "object",
+      "properties": { "kind": { "enum": ["cut", "xfade"] }, "frames": { "type": "integer", "minimum": 1, "maximum": 60 } },
+      "required": ["kind"],
+      "description": "Owns exactly the overlap it needs; validator permits same-lane overlap only where an xfade claims it"
+    },
+    "fit": { "enum": ["hold", "cut", "stretch", "error"], "default": "hold", "description": "Policy when active version duration != slot duration" },
+    "props": { "type": "object", "description": "Remotion engine only: values for the composition's exported propsSchema, passed via --props" },
+    "active": { "type": ["string", "null"], "description": "vid of the active version; null = planned/no take" },
+    "versions": {
+      "type": "array",
+      "description": "APPEND-ONLY. Files are write-once and hash-named; overwriting is structurally impossible.",
+      "items": {
+        "type": "object",
+        "required": ["vid", "file", "sha256", "created_at", "provenance"],
+        "properties": {
+          "vid": { "type": "string", "description": "v1, v2, … or cand-<hash4> for unpicked candidates" },
+          "file": { "type": "string", "description": "work/generated/<sceneId>/<vid>-<hash8>.mp4 — relative, no traversal" },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "probe": {
+            "type": "object",
+            "properties": {
+              "w": { "type": "integer" }, "h": { "type": "integer" },
+              "fps": { "type": "string", "description": "exact fraction, e.g. 30/1" },
+              "dur_s": { "type": "number" },
+              "conformed": { "type": "boolean", "description": "true once ingest transcoded to comp-native" }
+            }
+          },
+          "provenance": {
+            "type": "object",
+            "required": ["provider"],
+            "properties": {
+              "provider": { "enum": ["remotion", "fable", "hyperframe", "media", "human"] },
+              "job_id": { "type": "string" },
+              "spec": { "type": "object", "description": "The regeneration contract: prompt/model/seed/params or comp+props. Stored verbatim from the job." },
+              "parent_vid": { "type": "string", "description": "Which take this revises — the revision DAG" },
+              "note": { "type": "string" }
+            }
+          },
+          "cost_usd": { "type": ["number", "null"] },
+          "moderation": { "type": ["string", "null"], "description": "pass | flagged:<reason> | null=not checked" }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

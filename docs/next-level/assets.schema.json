@@ -1,0 +1,158 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workbench/assets.schema.json",
+  "title": "assets.json — the ingested drop-folder catalog (videos/<project>/work/assets.json)",
+  "description": "Content-addressed catalog of everything ingested from videos/<project>/drop/. One entry per unique sha256. Feeds the classifier confirm-chips, the script<->VO aligner, and the edit-plan asset matcher. Mirrors the versions philosophy: content-addressed identity, provenance recorded, nothing overwritten. Written by tools/ingest_drop.py, updated by the library confirm-chip endpoint. Stdlib+ffprobe only; NO AI in this file.",
+  "type": "object",
+  "required": ["project", "schema_version", "generated_at", "assets"],
+  "additionalProperties": false,
+  "properties": {
+    "project": { "type": "string", "description": "e.g. video-7" },
+    "schema_version": { "const": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "drop_dir": { "type": "string", "description": "Relative to project dir, always videos/<project>/drop" },
+    "assets": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/asset" }
+    },
+    "counts": {
+      "type": "object",
+      "description": "Denormalized tallies for the top-bar ingest chip; recomputed on every write, never authoritative.",
+      "additionalProperties": { "type": "integer" }
+    }
+  },
+  "definitions": {
+    "asset": {
+      "type": "object",
+      "required": ["sha256", "class", "confidence", "status", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Identity. Two files with the same bytes are ONE asset (dedupe); the extra path is recorded under source.duplicate_of / aliases."
+        },
+        "source": {
+          "type": "object",
+          "required": ["drop_path", "filename", "bytes", "mtime"],
+          "additionalProperties": false,
+          "properties": {
+            "drop_path": { "type": "string", "description": "Path as dropped, relative to drop_dir, e.g. broll/03-dashboard-pan.mp4. Preserves the owner's folder structure verbatim." },
+            "filename": { "type": "string" },
+            "ext": { "type": "string" },
+            "bytes": { "type": "integer", "minimum": 0 },
+            "mtime": { "type": "string", "format": "date-time" },
+            "aliases": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Other drop_paths with identical bytes (dedupe collisions). Empty unless duplicated."
+            }
+          }
+        },
+        "class": {
+          "enum": ["script", "notes", "voiceover", "music", "broll", "screencast", "image", "brand_asset", "unknown"],
+          "description": "Classifier verdict. script=structured prose w/ headings/beats; notes=unstructured text; voiceover=speech-band mono-ish long audio; music=stereo spectral-spread audio; broll=camera clip; screencast=screen capture (UI res/fps/low-motion tells); image=still; brand_asset=logo/wordmark/lower-third-ish (alpha, small, in a brand/ or logos/ folder); unknown=below the confirm floor."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Classifier confidence for `class`."
+        },
+        "confidence_tier": {
+          "enum": ["high", "medium", "low"],
+          "description": "high (>=0.85) auto-files silently; medium (0.6-0.85) files but shows a soft confirm chip; low (<0.6) => class often 'unknown', REQUIRES a one-click confirm chip in the library. Never silently guess a low-confidence class."
+        },
+        "class_runner_up": {
+          "type": "object",
+          "description": "The second-best class + score, so the confirm chip offers the likely alternative as one tap.",
+          "additionalProperties": false,
+          "properties": {
+            "class": { "type": "string" },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "signals": {
+          "type": "object",
+          "description": "The raw evidence the classifier used, kept so a human (or a later smarter classifier) can audit the verdict. All optional; populated per media kind.",
+          "additionalProperties": false,
+          "properties": {
+            "mime": { "type": "string" },
+            "channels": { "type": "integer", "description": "audio: 1=mono (VO tell), 2=stereo (music tell)" },
+            "sample_rate": { "type": "integer" },
+            "stereo_correlation": { "type": "number", "description": "audio: ~1.0 dual-mono/VO, <0.9 true-stereo/music" },
+            "speech_band_ratio": { "type": "number", "description": "audio: fraction of energy in 300-3400 Hz; high => voice" },
+            "spectral_spread": { "type": "number", "description": "audio: wide => music, narrow => voice" },
+            "silence_ratio": { "type": "number", "description": "audio: VO has speech-gap pauses; music is continuous" },
+            "width": { "type": "integer" },
+            "height": { "type": "integer" },
+            "fps": { "type": "string", "description": "exact fraction e.g. 30/1; whole-integer low fps + exact desktop res => screencast" },
+            "duration_s": { "type": "number" },
+            "is_exact_display_res": { "type": "boolean", "description": "matches a common desktop/window resolution => screencast tell" },
+            "motion_score": { "type": "number", "description": "video: mean inter-frame delta on sampled frames; low+desktop-res => screencast, high => broll" },
+            "has_alpha": { "type": "boolean", "description": "image: transparency => likely brand_asset/overlay" },
+            "megapixels": { "type": "number" },
+            "text_structure": {
+              "type": "object",
+              "description": "text files: cheap structure probe that separates script from notes",
+              "additionalProperties": false,
+              "properties": {
+                "heading_count": { "type": "integer" },
+                "has_scene_markers": { "type": "boolean", "description": "e.g. lines like '## Scene 3', 'HOOK:', '[b-roll]'" },
+                "paragraph_count": { "type": "integer" },
+                "word_count": { "type": "integer" },
+                "prose_ratio": { "type": "number", "description": "fraction of lines that are full sentences vs fragments" }
+              }
+            }
+          }
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Free tags used by the matcher's token overlap. AUTO-DERIVED (never required from the owner): folder names become tags (drop/broll/ => 'broll'; drop/dashboard/ => 'dashboard'), filename tokens split on separators (03-dashboard-pan => ['dashboard','pan']), numeric prefixes stripped into order_hint. Owner-added tags via confirm chip append here."
+        },
+        "order_hint": {
+          "type": ["integer", "null"],
+          "description": "Parsed from a leading numeric prefix (03-... => 3). A soft hint to scene ordering / matching; NEVER required and never authoritative."
+        },
+        "status": {
+          "enum": ["new", "filed", "used", "rejected"],
+          "description": "new=just ingested, awaiting classify commit; filed=classified + placed, available to the matcher; used=referenced by >=1 approved scene; rejected=owner dismissed (kept for dedupe, hidden from matcher)."
+        },
+        "filed_to": {
+          "type": ["string", "null"],
+          "description": "Canonical resting path after ingest, relative to project dir. Convention: work/library/<class>/<sha8>-<slug><ext>. VO/script also copied to their pipeline homes (see notes). null until filed."
+        },
+        "conformed": {
+          "type": "object",
+          "description": "For clips that will hit bake: the comp-native rendition (1080p, comp fps, 8-bit H.264, aac) produced by ingest-conform, content-addressed like a take. Absent for stills/audio/text.",
+          "additionalProperties": false,
+          "properties": {
+            "file": { "type": "string", "description": "work/library/conformed/<sha8>.mp4, relative, no traversal" },
+            "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "probe": {
+              "type": "object",
+              "properties": {
+                "w": { "type": "integer" },
+                "h": { "type": "integer" },
+                "fps": { "type": "string" },
+                "dur_s": { "type": "number" }
+              }
+            }
+          }
+        },
+        "referenced_by": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Scene ids in edit-plan.json / timeline.json that use this asset. Drives the `used` status and safe-delete. Empty => orphan, safe to prune."
+        },
+        "roles": {
+          "type": "array",
+          "items": { "enum": ["primary_vo", "vo_take", "script_master", "base_track_candidate", "music_bed", "cutaway", "image_kenburns", "screencast", "brand"] },
+          "description": "How the planner may use this asset. e.g. the picked VO take gets primary_vo; a wide calm b-roll clip earns base_track_candidate (the VO-mode master base layer)."
+        },
+        "notes": { "type": "string" }
+      }
+    }
+  }
+}

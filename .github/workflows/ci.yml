@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python and Remotion checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: remotion/package-lock.json
+
+      - name: Compile Python sources
+        run: git ls-files -z '*.py' | xargs -0 python -m py_compile
+
+      - name: Install Remotion dependencies
+        run: npm ci
+        working-directory: remotion
+
+      - name: Generate Remotion registry
+        run: npm run gen
+        working-directory: remotion
+
+      - name: Run workbench tests
+        if: ${{ hashFiles('tools/editor/test_server.py') != '' }}
+        run: python tools/editor/test_server.py -v
+
+      - name: Check Node scripts
+        run: for script in scripts/*.mjs; do node --check "$script"; done
+        working-directory: remotion
+
+      - name: Type-check Remotion
+        run: npx tsc --noEmit
+        working-directory: remotion
