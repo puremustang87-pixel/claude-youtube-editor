@@ -14,6 +14,7 @@ or repurpose; deprecate by leaving documented.
 | `E_NO_ACTIVE_TAKE` | enabled non-remotion scene has no `active_take_uid` |
 | `E_ASSET_MISSING` | active take's `file` does not exist on disk |
 | `E_ASSET_OUTSIDE_PROJECT` | persisted path fails containment (absolute, `..`, drive letter, symlink escape) |
+| `E_ASSET_NONCANONICAL` | non-legacy active take is outside `work/generated/<scene_uid>/<take_uid>/asset.<ext>` |
 | `E_ASSET_UNCONFORMED` | take profile is `original` where the scene type requires a conformed profile |
 | `E_PROFILE_MISMATCH` | overlay scene whose active take is not `overlay_alpha` (or has no alpha), or cutaway with alpha-only artifact |
 | `E_COMP_NOT_FOUND` | engine=remotion and `composition_id` not in the generated registry |

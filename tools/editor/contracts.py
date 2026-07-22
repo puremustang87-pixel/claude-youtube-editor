@@ -11,6 +11,7 @@ import copy
 import hashlib
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -22,6 +23,9 @@ ENGINES = {"remotion", "fable", "hyperframe", "media"}
 STATUSES = {"planned", "generating", "draft", "approved"}
 PROFILES = {"cutaway_h264", "overlay_alpha", "image_norm", "audio_norm", "original"}
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_SHA256_CACHE_MAX = 256
+_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+_SHA256_CACHE_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
@@ -44,6 +48,37 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_file_cached(path: Path) -> str:
+    """Hash a stable file once per path/mtime/size tuple.
+
+    Legacy migration runs on every project load until the upgraded timeline is
+    saved.  Large source videos must not be synchronously re-hashed each time.
+    """
+    resolved = path.resolve(strict=True)
+    for _ in range(3):
+        before = resolved.stat()
+        key = (str(resolved), before.st_mtime_ns, before.st_size)
+        with _SHA256_CACHE_LOCK:
+            cached = _SHA256_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        digest = sha256_file(resolved)
+        after = resolved.stat()
+        confirmed = (str(resolved), after.st_mtime_ns, after.st_size)
+        if confirmed != key:
+            continue
+
+        with _SHA256_CACHE_LOCK:
+            for stale in [item for item in _SHA256_CACHE if item[0] == key[0] and item != key]:
+                _SHA256_CACHE.pop(stale, None)
+            while len(_SHA256_CACHE) >= _SHA256_CACHE_MAX:
+                _SHA256_CACHE.pop(next(iter(_SHA256_CACHE)))
+            _SHA256_CACHE[key] = digest
+        return digest
+    raise OSError(f"asset changed while hashing: {resolved}")
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -90,7 +125,10 @@ def _legacy_take(asset: str, root: Path, project: Path, now: str) -> dict | None
         "provenance": {"provider": "media", "note": "migrated from legacy asset"},
     }
     if not outside and path is not None and path.is_file():
-        take["sha256"] = sha256_file(path)
+        try:
+            take["sha256"] = sha256_file_cached(path)
+        except OSError:
+            pass
     return take
 
 
@@ -111,7 +149,10 @@ def _version_to_take(version: dict, root: Path, project: Path, now: str) -> dict
     if not take.get("sha256") and take.get("file"):
         path, outside = resolve_persisted_path(root, project, take["file"])
         if not outside and path and path.is_file():
-            take["sha256"] = sha256_file(path)
+            try:
+                take["sha256"] = sha256_file_cached(path)
+            except OSError:
+                pass
     return take
 
 
@@ -210,6 +251,21 @@ def issue(code: str, severity: str, message: str, scene_uid: str | None = None, 
     return result
 
 
+def _is_migrated_legacy_take(take: dict) -> bool:
+    provenance = take.get("provenance")
+    note = str(provenance.get("note", "")) if isinstance(provenance, dict) else ""
+    return note.startswith("migrated from legacy ") or note.startswith("migrated from interim ")
+
+
+def is_canonical_take_path(path: Path, project: Path, scene_uid: str, take_uid: str) -> bool:
+    """Return whether a generated take occupies its immutable v2.1 namespace."""
+    expected = (project / "work" / "generated" / scene_uid / take_uid).resolve(strict=False)
+    return (
+        path.parent.resolve(strict=False) == expected
+        and re.fullmatch(r"asset\.[A-Za-z0-9]+", path.name) is not None
+    )
+
+
 def validate_timeline(
     timeline: dict,
     catalog: dict[str, dict],
@@ -281,6 +337,14 @@ def validate_timeline(
             path, outside = resolve_persisted_path(root, project, file_value)
             if outside:
                 issues.append(issue("E_ASSET_OUTSIDE_PROJECT", "E", "active take path is outside the project", uid, {"file": file_value}))
+            elif path is not None and not _is_migrated_legacy_take(take) and not is_canonical_take_path(
+                path, project, uid, str(take.get("take_uid", ""))
+            ):
+                issues.append(issue(
+                    "E_ASSET_NONCANONICAL", "E",
+                    "active take must use work/generated/<scene_uid>/<take_uid>/asset.<ext>",
+                    uid, {"file": file_value},
+                ))
             elif path is None or not path.is_file():
                 issues.append(issue("E_ASSET_MISSING", "E", "active take file is missing", uid, {"file": file_value}))
             profile = take.get("conform_profile")

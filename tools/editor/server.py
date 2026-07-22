@@ -111,6 +111,7 @@ scene_jobs = {
     "bake": {"running": False, "log": "", "ok": None, "output": None, "job_id": None},
 }
 job_lock = threading.Lock()
+timeline_lock = threading.Lock()
 
 
 def proxy_fps() -> str:
@@ -271,6 +272,7 @@ def normalize_timeline(payload: object) -> tuple[dict | None, list[str], list[st
     save_blocking = {
         "E_SCENE_SCHEMA", "E_SPAN_INVALID", "E_OVERLAP_UNCLAIMED",
         "E_COMP_NOT_FOUND", "E_LEGACY_ID_COLLISION", "E_ASSET_OUTSIDE_PROJECT",
+        "E_ASSET_NONCANONICAL",
     }
     errors = [item["message"] for item in issues if item["code"] in save_blocking]
     warnings = [item["message"] for item in issues if item["severity"] == "W"]
@@ -621,21 +623,22 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def save_timeline_document(self, value) -> None:
-        if not self.require_timeline_match():
-            return
         timeline, errors, warnings = normalize_timeline(value)
-        if errors:
-            self.send_json({
-                "error": "timeline validation failed",
-                "errors": errors,
-                "warnings": warnings,
-                "issues": project_validation(timeline) if timeline else [],
-            }, 400)
-            return
-        assert timeline is not None
-        backup = backup_and_write(TIMELINE, timeline, "backups", "timeline")
-        etag = timeline_etag()
-        issues = project_validation(timeline)
+        with timeline_lock:
+            if not self.require_timeline_match():
+                return
+            if errors:
+                self.send_json({
+                    "error": "timeline validation failed",
+                    "errors": errors,
+                    "warnings": warnings,
+                    "issues": project_validation(timeline) if timeline else [],
+                }, 400)
+                return
+            assert timeline is not None
+            backup = backup_and_write(TIMELINE, timeline, "backups", "timeline")
+            etag = timeline_etag()
+            issues = project_validation(timeline)
         self.send_json({
             "saved": True,
             "backup": backup,

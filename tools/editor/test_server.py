@@ -1,5 +1,6 @@
 """Stdlib tests for scene timeline validation and safe persistence."""
 
+import concurrent.futures
 import importlib.util
 import json
 import os
@@ -26,6 +27,12 @@ try:
 finally:
     sys.argv = ORIGINAL_ARGV
 
+CONTRACTS = sys.modules["contracts"]
+TEST_CATALOG = [
+    {"id": "BrandProof", "durationInFrames": 300, "fps": 60, "width": 1920, "height": 1080},
+    {"id": "BigStatement", "durationInFrames": 300, "fps": 60, "width": 1920, "height": 1080},
+]
+
 
 def payload(*shots):
     return {
@@ -44,6 +51,13 @@ def payload(*shots):
 
 
 class TimelineTests(unittest.TestCase):
+    def setUp(self):
+        # Unit tests must work in a clean clone before `npm run gen` creates the
+        # ignored Remotion registry.
+        catalog = mock.patch.object(SERVER, "remotion_catalog", return_value=TEST_CATALOG)
+        catalog.start()
+        self.addCleanup(catalog.stop)
+
     def test_remotion_and_disabled_hyperframe_scene_are_valid(self):
         timeline, errors, warnings = SERVER.normalize_timeline(payload(
             {
@@ -98,6 +112,72 @@ class TimelineTests(unittest.TestCase):
         self.assertTrue(any(item["code"] == "E_ASSET_OUTSIDE_PROJECT" for item in issues))
         shot = timeline["shots"][0]
         self.assertEqual(shot["takes"][0]["file"], "C:/outside/clip.mp4")
+
+    def test_legacy_asset_hash_is_cached_until_file_changes(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-hash-") as folder:
+            project = Path(folder)
+            asset = project / "work" / "legacy.mp4"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(b"first asset")
+            document = payload({
+                "id": "legacy", "engine": "media", "type": "cutaway",
+                "master_in_s": 1, "master_out_s": 6, "enabled": True,
+                "asset": "work/legacy.mp4",
+            })
+            with CONTRACTS._SHA256_CACHE_LOCK:
+                CONTRACTS._SHA256_CACHE.clear()
+            self.addCleanup(CONTRACTS._SHA256_CACHE.clear)
+            with mock.patch.object(CONTRACTS, "sha256_file", wraps=CONTRACTS.sha256_file) as hasher:
+                CONTRACTS.migrate_timeline(document, set(), project, project)
+                CONTRACTS.migrate_timeline(document, set(), project, project)
+                self.assertEqual(hasher.call_count, 1)
+
+                asset.write_bytes(b"second asset with a new size")
+                CONTRACTS.migrate_timeline(document, set(), project, project)
+                self.assertEqual(hasher.call_count, 2)
+
+    def test_nonlegacy_take_must_use_canonical_generated_namespace(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-takes-") as folder:
+            project = Path(folder)
+            scene_uid = "scn_ABCDEFGH"
+            take_uid = "take_ABCDEFGH"
+            canonical = project / "work" / "generated" / scene_uid / take_uid / "asset.mp4"
+            canonical.parent.mkdir(parents=True)
+            canonical.write_bytes(b"canonical")
+
+            scene = {
+                "scene_uid": scene_uid, "id": scene_uid, "engine": "media", "type": "cutaway",
+                "master_in_s": 1, "master_out_s": 6, "enabled": True, "status": "draft",
+                "fit": "hold", "z": 0, "transition_in": {"kind": "cut"},
+                "active_take_uid": take_uid,
+                "takes": [{
+                    "take_uid": take_uid,
+                    "file": f"work/generated/{scene_uid}/{take_uid}/asset.mp4",
+                    "created_at": SERVER.utc_now(),
+                    "sha256": "0" * 64,
+                    "conform_profile": "cutaway_h264",
+                    "provenance": {"provider": "human"},
+                }],
+            }
+            document = payload(scene)
+            issues = SERVER.validate_timeline(document, {}, project, project)
+            self.assertFalse(any(item["code"] == "E_ASSET_NONCANONICAL" for item in issues))
+
+            noncanonical = project / "work" / "elsewhere" / "asset.mp4"
+            noncanonical.parent.mkdir(parents=True)
+            noncanonical.write_bytes(b"wrong namespace")
+            scene["takes"][0]["file"] = "work/elsewhere/asset.mp4"
+            issues = SERVER.validate_timeline(document, {}, project, project)
+            self.assertTrue(any(item["code"] == "E_ASSET_NONCANONICAL" for item in issues))
+
+            legacy = CONTRACTS.migrate_timeline(payload({
+                "id": "legacy", "engine": "media", "type": "cutaway",
+                "master_in_s": 1, "master_out_s": 6, "enabled": True,
+                "asset": "work/elsewhere/asset.mp4",
+            }), set(), project, project)
+            issues = SERVER.validate_timeline(legacy, {}, project, project)
+            self.assertFalse(any(item["code"] == "E_ASSET_NONCANONICAL" for item in issues))
+            self.assertTrue(any(item["code"] == "E_ASSET_UNCONFORMED" for item in issues))
 
     def test_two_placements_can_share_one_composition(self):
         timeline, errors, _ = SERVER.normalize_timeline(payload(
@@ -243,6 +323,78 @@ class TimelineTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+                for patcher in reversed(patches):
+                    patcher.stop()
+
+    def test_concurrent_saves_with_one_etag_allow_exactly_one_winner(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-race-") as folder:
+            project = Path(folder)
+            timeline_path = project / "work" / "timeline.json"
+            patches = (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "TIMELINE", timeline_path),
+                mock.patch.object(SERVER, "EDITOR_MANIFEST", project / "work" / "editor" / "manifest.json"),
+                mock.patch.object(SERVER, "PROXY", project / "work" / "editor" / "proxy.mp4"),
+            )
+            for patcher in patches:
+                patcher.start()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), SERVER.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                load_request = urllib.request.Request(
+                    base + "/api/scenes", headers={"X-Workbench-Token": SERVER.SESSION_TOKEN}
+                )
+                with urllib.request.urlopen(load_request, timeout=5) as response:
+                    loaded = json.load(response)
+
+                first = json.loads(json.dumps(loaded["timeline"]))
+                second = json.loads(json.dumps(loaded["timeline"]))
+                first["preview"]["end_s"] = 11
+                second["preview"]["end_s"] = 12
+                barrier = threading.Barrier(2)
+                original_normalize = SERVER.normalize_timeline
+
+                def synchronized_normalize(value):
+                    result = original_normalize(value)
+                    barrier.wait(timeout=5)
+                    return result
+
+                def put(document):
+                    request = urllib.request.Request(
+                        base + "/api/timeline",
+                        data=json.dumps({"timeline": document}).encode("utf-8"),
+                        method="PUT",
+                        headers={
+                            "Content-Type": "application/json",
+                            "If-Match": loaded["etag"],
+                            "X-Workbench-Token": SERVER.SESSION_TOKEN,
+                        },
+                    )
+                    try:
+                        with urllib.request.urlopen(request, timeout=10) as response:
+                            return response.status, json.load(response)
+                    except urllib.error.HTTPError as error:
+                        try:
+                            return error.code, json.loads(error.read())
+                        finally:
+                            error.close()
+
+                with mock.patch.object(SERVER, "normalize_timeline", side_effect=synchronized_normalize):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                        results = list(executor.map(put, (first, second)))
+
+                self.assertEqual(sorted(status for status, _ in results), [200, 409])
+                winner = next(body for status, body in results if status == 200)
+                conflict = next(body for status, body in results if status == 409)
+                persisted = json.loads(timeline_path.read_text(encoding="utf-8"))
+                self.assertEqual(conflict["code"], "E_ETAG_MISMATCH")
+                self.assertEqual(persisted["preview"]["end_s"], winner["timeline"]["preview"]["end_s"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
                 for patcher in reversed(patches):
                     patcher.stop()
 
