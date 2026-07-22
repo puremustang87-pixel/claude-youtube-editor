@@ -21,12 +21,12 @@ Nothing reaches `main` without an owner merge. Codex builds on `codex/*` branche
 
 ## In review (open PRs)
 
-- 🔍 **PR #1 — engine foundation slice** · branch `codex/fable5-engine-foundation` · commit `c376216`
+- 🔍 **PR #1 — engine foundation slice** · branch `codex/fable5-engine-foundation` · commit `134f9bc`
   - Fable review: **posted** (COMMENT). Verdict: strong foundation, merge after fixes.
-  - 🔴 **F1 (blocking)** — lost-update: no lock around timeline etag-check→write (`server.py:598-636`).
-  - 🔴 **F2 (blocking)** — re-hashes every asset on every load (`contracts.py:92-114`).
-  - 🟡 F3 — validator doesn't enforce the canonical take namespace. 🟡 F4 — 3 tests need `npm run gen` first.
-  - **Next action: Codex fixes F1+F2 → Fable re-audits → owner merges.**
+  - ✅ F1–F4 fixes pushed: atomic ETag save lock, cached legacy hashing, canonical take paths,
+    and a self-contained clean-checkout test suite.
+  - ✅ 15 tests pass; the two-writer race regression repeatedly returns one `200` and one `409`.
+  - **Next action: Fable re-audits commit `134f9bc` → owner merges.**
 
 ## Next up (not started)
 
@@ -47,5 +47,5 @@ Nothing reaches `main` without an owner merge. Codex builds on `codex/*` branche
 git clone https://github.com/puremustang87-pixel/claude-youtube-editor
 cd claude-youtube-editor && git checkout codex/fable5-engine-foundation
 npm --prefix remotion install && npm --prefix remotion run gen
-python -m unittest tools.editor.test_server -v      # expect: OK
+python tools/editor/test_server.py -v               # expect: 15 tests, OK
 ```
