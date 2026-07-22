@@ -1,0 +1,51 @@
+# File manifest — status vs upstream a8abff81 (A=added, M=modified)
+M  CLAUDE.md
+A  IMPROVEMENTS.md
+A  fork-docs/claude-skills/clean-cut/SKILL.md
+A  fork-docs/claude-skills/fake-screencast/SKILL.md
+A  fork-docs/claude-skills/make-tsx/SKILL.md
+A  fork-docs/claude-skills/real-screencast/SKILL.md
+A  fork-docs/claude-skills/vidtsx-2d-generator/SKILL.md
+A  remotion/src/lib/realscreencast.tsx
+A  tools/apply_fork_docs.py
+M  tools/capture_web.py
+M  tools/editor/index.html
+M  tools/editor/server.py
+A  tools/encoders.py
+A  tools/fixtures/black.png
+A  tools/fixtures/blank.png
+A  tools/fixtures/capture-demo-manifest.json
+A  tools/fixtures/good_a.png
+A  tools/fixtures/good_b.png
+A  tools/fixtures/shifted.png
+A  tools/gen_screencast.py
+M  tools/make_proxy.py
+M  tools/render_cuts.py
+A  tools/verify_frames.py
+M  tools/yt_upload.py
+
+ CLAUDE.md                                          |  15 +-
+ IMPROVEMENTS.md                                    | 148 ++++
+ fork-docs/claude-skills/clean-cut/SKILL.md         | 103 +++
+ fork-docs/claude-skills/fake-screencast/SKILL.md   | 118 ++++
+ fork-docs/claude-skills/make-tsx/SKILL.md          |  72 ++
+ fork-docs/claude-skills/real-screencast/SKILL.md   | 141 ++++
+ .../claude-skills/vidtsx-2d-generator/SKILL.md     | 283 ++++++++
+ remotion/src/lib/realscreencast.tsx                | 270 ++++++++
+ tools/apply_fork_docs.py                           |  84 +++
+ tools/capture_web.py                               | 120 +++-
+ tools/editor/index.html                            |  17 +-
+ tools/editor/server.py                             |  23 +
+ tools/encoders.py                                  | 279 ++++++++
+ tools/fixtures/black.png                           | Bin 0 -> 577 bytes
+ tools/fixtures/blank.png                           | Bin 0 -> 605 bytes
+ tools/fixtures/capture-demo-manifest.json          |  71 ++
+ tools/fixtures/good_a.png                          | Bin 0 -> 1689 bytes
+ tools/fixtures/good_b.png                          | Bin 0 -> 1689 bytes
+ tools/fixtures/shifted.png                         | Bin 0 -> 1722 bytes
+ tools/gen_screencast.py                            | 497 ++++++++++++++
+ tools/make_proxy.py                                |  15 +-
+ tools/render_cuts.py                               |  71 +-
+ tools/verify_frames.py                             | 755 +++++++++++++++++++++
+ tools/yt_upload.py                                 |  85 ++-
+ 24 files changed, 3128 insertions(+), 39 deletions(-)

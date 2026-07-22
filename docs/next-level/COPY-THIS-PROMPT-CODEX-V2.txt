@@ -1,0 +1,40 @@
+You are implementing the NEXT-LEVEL packet for the AI video workbench — the script-driven
+drop-folder pipeline. This composes with the fable5-workbench-packet you are already building
+(UI five rules, scene/job schemas, Slice-1 immutable takes): finish that first if you haven't.
+
+Read NEXT-LEVEL.md, then build in this order:
+
+N1 INGEST (PIPELINE-DESIGN.md Slice A): tools/ingest_drop.py — hash, ffprobe classify with the
+   anti-guessing confirm-chip rule, conform via the Slice-1 ingest function, write assets.json
+   per assets.schema.json, file assets to canonical locations, library "New" cards + chips.
+   Fully testable offline; write the Slice A test list into tools/editor/test_server.py.
+
+N2 ALIGN (Slice B, first half): extract keyterms from the dropped script into work/keyterms.txt,
+   run the EXISTING transcribe.py unchanged, then align_script.py (stdlib difflib; rapidfuzz
+   optional) → work/script-map.json per PIPELINE-DESIGN §3. Handle ad-libs, multi-take VO,
+   low-confidence spans exactly as specified.
+
+N3 PLAN + APPROVAL (Slice B, second half): the plan generator consumes EDITING-BRAIN.md rules
+   (parse its WHEN→DO parameters into config, do not hardcode) + assets.json + script-map.json →
+   work/edit-plan.json per editplan.schema.json, rev history append-only. Run the brain's §6
+   self-QA before presenting. Approval gate is the ONE permitted new full-screen mode
+   (justification + UX in PIPELINE-DESIGN §5); it borrows the shell's tokens and exits into the
+   normal workbench on approval.
+
+N4 COMPILE + SOUND (Slice C): approved plan → timeline.json scenes (fable5 scene.schema.json),
+   VO-synth master ([VO audio]+[base track]) so bake.py runs UNMODIFIED, sfx compile into the
+   existing sfx-plan/mixer flow, music bed with the brain's §4.2 ducking numbers, and integrate
+   ffmpeg-normalize (MIT) for −14 LUFS / −1 dBTP delivery per §5.
+
+N5 LEVERAGE (optional, after demo passes): PySceneDetect b-roll pre-trim, torchaudio forced_align
+   upgrade path, OpenTimelineIO export adapter.
+
+LICENSE RULES (from OSS-INTEGRATIONS.md — respect the verdicts): vendor only MIT/BSD/Apache;
+GPL/AGPL tools are subprocess-only; do NOT use madmom models (CC-NC) or videogrep code; flag the
+bundled RNNoise models' unresolved license in your report.
+
+Acceptance = the end-to-end demo at the bottom of NEXT-LEVEL.md, plus: every new behavior has a
+test; the existing Remotion + timeline.json + bake contracts unchanged; Windows + POSIX both work.
+
+Report back: what you built, deviations + why, test results, a screen recording or screenshots of
+drop → plan → approve → compiled timeline.

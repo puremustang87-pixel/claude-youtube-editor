@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Workbench — video-1 · redesign mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ============ TOKENS (see design-tokens.css — keep in sync) ============ */
+:root{
+  --bg0:#0a0c10; --bg1:#10131a; --bg2:#151924; --bg3:#1c2130;
+  --line:rgba(148,163,184,.09); --line2:rgba(148,163,184,.20);
+  --txt:#e2e8f0; --txt2:#94a3b8; --txt3:#64748b;
+  --ind:#6366f1; --ind-soft:rgba(99,102,241,.14);
+  --vio:#a78bfa; --cyn:#22d3ee; --grn:#34d399; --amb:#fbbf24; --red:#f87171; --slate:#64748b;
+  --r1:6px; --r2:10px; --r3:14px;
+  --sans:'Inter',ui-sans-serif,system-ui,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,monospace;
+  --shadow:0 8px 28px rgba(0,0,0,.45);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg0);color:var(--txt);font:13px/1.45 var(--sans);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+input,select,textarea{font:inherit;color:var(--txt);background:var(--bg0);border:1px solid var(--line2);border-radius:var(--r1);padding:6px 8px;outline:none;width:100%}
+input:focus,select:focus,textarea:focus{border-color:var(--ind)}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:4px}
+
+/* ============ APP GRID — one window, three zones, one focus ============ */
+#app{display:grid;height:100vh;
+  grid-template-rows:46px 1fr 26px;
+  grid-template-columns:252px 1fr 288px;
+  grid-template-areas:"top top top" "lib stage insp" "foot foot foot"}
+
+/* ============ TOP BAR — identity · master clock · state & actions ============ */
+#top{grid-area:top;display:flex;align-items:center;gap:14px;padding:0 14px;background:var(--bg1);border-bottom:1px solid var(--line)}
+.wordmark{font-weight:700;letter-spacing:.14em;font-size:11px;color:var(--txt2)}
+.wordmark b{color:var(--ind)}
+.proj{font-family:var(--mono);font-size:12px;color:var(--txt);background:var(--bg2);border:1px solid var(--line);padding:4px 10px;border-radius:999px}
+#clock{margin-left:auto;margin-right:auto;font-family:var(--mono);font-size:15px;font-weight:600;letter-spacing:.04em}
+#clock span{color:var(--txt3);font-weight:400}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:var(--bg2);color:var(--txt2)}
+.chip .dot{width:7px;height:7px;border-radius:50%}
+.dot.ok{background:var(--grn)} .dot.warn{background:var(--amb)} .dot.run{background:var(--ind);animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.btn{padding:7px 14px;border-radius:var(--r1);border:1px solid var(--line2);background:var(--bg2);font-weight:600;font-size:12px;transition:all .15s}
+.btn:hover{border-color:var(--ind);color:#fff}
+.btn.primary{background:var(--ind);border-color:var(--ind);color:#fff}
+.btn.primary:hover{filter:brightness(1.12)}
+.btn.ghost{border-color:transparent;color:var(--txt2)} .btn.ghost:hover{color:var(--txt)}
+
+/* ============ LIBRARY (left) — the only list on screen ============ */
+#lib{grid-area:lib;background:var(--bg1);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.lib-head{padding:12px 12px 8px}
+.seg{display:flex;background:var(--bg0);border:1px solid var(--line);border-radius:var(--r1);padding:2px;margin-bottom:10px}
+.seg button{flex:1;padding:5px 0;border-radius:4px;color:var(--txt3);font-weight:600;font-size:11.5px}
+.seg button.on{background:var(--bg3);color:var(--txt)}
+.search{position:relative}
+.search input{padding-left:28px;background:var(--bg0)}
+.search svg{position:absolute;left:8px;top:8px;opacity:.4}
+.filters{display:flex;gap:5px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line)}
+.fchip{font-size:10.5px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);color:var(--txt3);font-weight:600}
+.fchip.on{border-color:var(--ind);color:var(--ind);background:var(--ind-soft)}
+.fchip.blocking.on{border-color:var(--red);color:var(--red);background:rgba(248,113,113,.1)}
+#scenelist{flex:1;overflow-y:auto;padding:8px}
+.scard{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:var(--r2);border:1px solid transparent;cursor:pointer;transition:background .12s}
+.scard:hover{background:var(--bg2)}
+.scard.sel{background:var(--bg2);border-color:var(--ind)}
+.eng{width:8px;height:8px;border-radius:3px;flex:none}
+.scard .meta{min-width:0;flex:1}
+.scard .name{font-weight:600;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scard .sub{font-family:var(--mono);font-size:10px;color:var(--txt3);margin-top:1px}
+.status{font-size:9.5px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:999px;flex:none;text-transform:uppercase}
+.st-approved{color:var(--grn);background:rgba(52,211,153,.12)}
+.st-draft{color:var(--amb);background:rgba(251,191,36,.12)}
+.st-generating{color:var(--ind);background:var(--ind-soft);animation:pulse 1.4s infinite}
+.st-planned{color:var(--txt3);background:rgba(100,116,139,.14)}
+.st-blocked{color:var(--red);background:rgba(248,113,113,.12)}
+.lib-foot{padding:10px 12px;border-top:1px solid var(--line)}
+.lib-foot .btn{width:100%}
+
+/* ============ STAGE (center) — preview above, timeline below, takes slide between ============ */
+#stage{grid-area:stage;display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg0)}
+#preview{flex:1;display:flex;align-items:center;justify-content:center;padding:18px 24px 10px;min-height:0}
+.frame{position:relative;aspect-ratio:16/9;max-height:100%;max-width:100%;border-radius:var(--r3);overflow:hidden;border:1px solid var(--line2);box-shadow:var(--shadow);background:
+  radial-gradient(120% 90% at 70% 20%, #1e2745 0%, #0d1120 55%, #080a12 100%)}
+.frame .mock{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+.frame .mock .kicker{font-size:10px;letter-spacing:.3em;color:var(--vio);font-weight:700}
+.frame .mock h1{font-size:clamp(18px,3.2vw,34px);font-weight:700;background:linear-gradient(100deg,#fff,#c7d2fe);-webkit-background-clip:text;background-clip:text;color:transparent}
+.frame .tc{position:absolute;left:12px;bottom:10px;font-family:var(--mono);font-size:11px;color:var(--txt2);background:rgba(8,10,16,.7);padding:3px 8px;border-radius:5px;border:1px solid var(--line)}
+.frame .ab{position:absolute;right:12px;top:10px;display:none;gap:2px;background:rgba(8,10,16,.8);border:1px solid var(--line2);border-radius:999px;padding:2px}
+.frame .ab button{font-size:10px;font-weight:700;padding:3px 10px;border-radius:999px;color:var(--txt3)}
+.frame .ab button.on{background:var(--ind);color:#fff}
+.frame.comparing .ab{display:flex}
+.frame .playbtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:52px;height:52px;border-radius:50%;background:rgba(10,12,18,.55);border:1px solid var(--line2);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s}
+.frame:hover .playbtn{opacity:1}
+
+/* ---- Takes drawer — belongs to the selection, lives between preview & timeline ---- */
+#takes{height:0;overflow:hidden;transition:height .22s ease;background:var(--bg1);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+#takes.open{height:118px}
+.takes-inner{display:flex;align-items:center;gap:10px;padding:10px 16px;height:118px}
+.takes-label{writing-mode:vertical-rl;transform:rotate(180deg);font-size:9.5px;font-weight:700;letter-spacing:.2em;color:var(--txt3)}
+.take{position:relative;flex:none;width:150px;height:92px;border-radius:var(--r2);overflow:hidden;border:1.5px solid var(--line2);cursor:pointer;transition:border-color .12s, transform .12s}
+.take:hover{transform:translateY(-2px)}
+.take.active{border-color:var(--grn)}
+.take.candidate{border-style:dashed;border-color:var(--amb)}
+.take .thumb{position:absolute;inset:0}
+.take .tag{position:absolute;left:6px;top:6px;font-family:var(--mono);font-size:9.5px;font-weight:600;padding:2px 6px;border-radius:4px;background:rgba(8,10,16,.75);border:1px solid var(--line)}
+.take .who{position:absolute;right:6px;top:6px;width:8px;height:8px;border-radius:3px}
+.take .foot{position:absolute;left:0;right:0;bottom:0;display:flex;justify-content:space-between;align-items:center;padding:4px 6px;background:linear-gradient(transparent,rgba(5,6,10,.85) 40%)}
+.take .foot .cost{font-family:var(--mono);font-size:9px;color:var(--txt3)}
+.take .act{display:none;gap:4px}
+.take:hover .act{display:flex}
+.take .act button{font-size:9.5px;font-weight:700;padding:2px 8px;border-radius:4px;background:var(--bg3);border:1px solid var(--line2)}
+.take .act button.pro{background:var(--grn);border-color:var(--grn);color:#06281c}
+.take.activeBadge::after{content:"ACTIVE";position:absolute;right:6px;bottom:26px;font-size:8px;font-weight:800;letter-spacing:.08em;color:var(--grn)}
+.take-new{flex:none;width:110px;height:92px;border-radius:var(--r2);border:1.5px dashed var(--line2);display:flex;flex-direction:column;gap:4px;align-items:center;justify-content:center;color:var(--txt3);font-size:11px;font-weight:600;cursor:pointer}
+.take-new:hover{border-color:var(--ind);color:var(--ind)}
+
+/* ============ TIMELINE — ruler with WORD ticks, two semantic lanes ============ */
+#timeline{flex:none;background:var(--bg1);padding:10px 16px 12px;user-select:none}
+.tl-head{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.tl-head .zoom{margin-left:auto;display:flex;gap:4px}
+.tl-title{font-size:10px;font-weight:700;letter-spacing:.18em;color:var(--txt3)}
+.tl-hint{font-size:10.5px;color:var(--txt3)}
+.tl-hint b{color:var(--txt2);font-weight:600}
+#ruler{position:relative;height:30px;border-bottom:1px solid var(--line)}
+.tick{position:absolute;bottom:0;width:1px;height:7px;background:var(--line2)}
+.tick.major{height:12px}
+.tick-label{position:absolute;bottom:13px;font-family:var(--mono);font-size:9px;color:var(--txt3);transform:translateX(-50%)}
+.wordtick{position:absolute;bottom:0;width:1px;height:4px;background:rgba(167,139,250,.35)}
+.lane{position:relative;height:46px;margin-top:8px;background:var(--bg0);border:1px solid var(--line);border-radius:var(--r1)}
+.lane-label{position:absolute;left:-4px;top:50%;transform:translate(-100%,-50%);font-size:9px;font-weight:700;letter-spacing:.14em;color:var(--txt3)}
+#lanes{position:relative;margin-left:64px}
+#ruler{margin-left:64px}
+.block{position:absolute;top:5px;bottom:5px;border-radius:6px;background:var(--bg3);border:1.5px solid var(--line2);overflow:hidden;cursor:pointer;display:flex;align-items:center;padding:0 8px;gap:6px;transition:border-color .12s, box-shadow .12s}
+.block:hover{border-color:var(--txt3)}
+.block.sel{border-color:var(--ind);box-shadow:0 0 0 3px var(--ind-soft)}
+.block .edge{position:absolute;top:0;bottom:0;width:6px;cursor:ew-resize;opacity:0}
+.block .edge.l{left:0}.block .edge.r{right:0}
+.block:hover .edge{opacity:1;background:linear-gradient(90deg,var(--ind),transparent)}
+.block .edge.r{background:linear-gradient(-90deg,var(--ind),transparent)}
+.block .bname{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.block .bstat{width:7px;height:7px;border-radius:50%;flex:none}
+.block.disabled{opacity:.38;border-style:dashed}
+.block.blocked{border-color:rgba(248,113,113,.5)}
+.eng-remotion{background:var(--ind)} .eng-fable{background:var(--vio)} .eng-hyperframe{background:var(--cyn)} .eng-media{background:var(--slate)}
+.block .engstripe{position:absolute;left:0;top:0;bottom:0;width:3px}
+#playhead{position:absolute;top:-36px;bottom:0;width:1.5px;background:var(--red);z-index:5;cursor:ew-resize}
+#playhead::before{content:"";position:absolute;top:0;left:-5.5px;border:6px solid transparent;border-top-color:var(--red)}
+
+/* ============ INSPECTOR (right) — only the selection, nothing else ============ */
+#insp{grid-area:insp;background:var(--bg1);border-left:1px solid var(--line);overflow-y:auto;min-height:0}
+.insp-empty{display:flex;height:100%;align-items:center;justify-content:center;flex-direction:column;gap:8px;color:var(--txt3);text-align:center;padding:24px}
+.insp-head{padding:14px 14px 10px;border-bottom:1px solid var(--line)}
+.insp-head .name{font-size:14.5px;font-weight:700;display:flex;align-items:center;gap:8px}
+.insp-head .idline{font-family:var(--mono);font-size:10px;color:var(--txt3);margin-top:3px}
+.sec{padding:12px 14px;border-bottom:1px solid var(--line)}
+.sec h4{font-size:9.5px;font-weight:700;letter-spacing:.16em;color:var(--txt3);margin-bottom:9px;text-transform:uppercase}
+.row{display:flex;gap:8px;margin-bottom:8px;align-items:center}
+.row label{flex:none;width:62px;font-size:11px;color:var(--txt2)}
+.row .snap{flex:none;font-size:9.5px;font-weight:700;color:var(--vio);padding:3px 7px;border:1px solid rgba(167,139,250,.3);border-radius:4px}
+.row .snap:hover{background:rgba(167,139,250,.12)}
+.mini{font-family:var(--mono);font-size:11.5px}
+.props-note{font-size:10.5px;color:var(--txt3);margin-top:6px;line-height:1.5}
+.insp-actions{padding:14px;display:flex;flex-direction:column;gap:8px}
+.insp-actions .rowbtns{display:flex;gap:8px}
+.insp-actions .rowbtns .btn{flex:1}
+
+/* ============ FOOTER — keyboard grammar, always visible ============ */
+#foot{grid-area:foot;display:flex;align-items:center;gap:16px;padding:0 14px;background:var(--bg1);border-top:1px solid var(--line);font-size:10px;color:var(--txt3)}
+#foot b{color:var(--txt2);font-family:var(--mono);font-weight:600;background:var(--bg3);padding:1px 5px;border-radius:3px;margin-right:3px}
+#foot .right{margin-left:auto}
+
+/* ============ DESIGN NOTES OVERLAY ============ */
+#notesbtn{position:fixed;right:16px;bottom:36px;z-index:60;width:34px;height:34px;border-radius:50%;background:var(--vio);color:#1e1338;font-weight:800;box-shadow:var(--shadow)}
+.note{position:fixed;z-index:55;max-width:250px;background:#1e1633;border:1px solid var(--vio);border-radius:var(--r2);padding:10px 12px;font-size:11px;line-height:1.5;color:#ddd6fe;box-shadow:var(--shadow);display:none}
+.note b{color:#fff}
+.note .n{display:inline-flex;width:16px;height:16px;border-radius:50%;background:var(--vio);color:#1e1338;font-weight:800;font-size:10px;align-items:center;justify-content:center;margin-right:6px}
+body.shownotes .note{display:block}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ TOP BAR ============ -->
+  <header id="top">
+    <span class="wordmark">WORK<b>BENCH</b></span>
+    <span class="proj">video-1</span>
+    <div class="seg" style="width:170px;margin:0">
+      <button class="on">Scenes</button><button>Cut</button>
+    </div>
+    <div id="clock">00:42.10 <span>/ 01:30.00</span></div>
+    <span class="chip" id="savechip"><span class="dot ok"></span>Saved · <span class="mini">etag 8f31c2</span></span>
+    <span class="chip" id="jobchip"><span class="dot run"></span>1 job · rendering 48%</span>
+    <button class="btn">Preview bake</button>
+    <button class="btn primary">Bake video</button>
+  </header>
+
+  <!-- ============ LIBRARY ============ -->
+  <aside id="lib">
+    <div class="lib-head">
+      <div class="seg"><button class="on">In timeline</button><button>Catalog · 38</button></div>
+      <div class="search">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input id="q" placeholder="Search scenes…">
+      </div>
+    </div>
+    <div class="filters" id="filters">
+      <button class="fchip on" data-f="all">All</button>
+      <button class="fchip" data-f="remotion">Remotion</button>
+      <button class="fchip" data-f="fable">Fable</button>
+      <button class="fchip" data-f="hyperframe">Hyperframe</button>
+      <button class="fchip" data-f="media">Media</button>
+      <button class="fchip blocking" data-f="blocking">⚠ Blocking bake</button>
+    </div>
+    <div id="scenelist"></div>
+    <div class="lib-foot"><button class="btn">＋ Add scene at playhead</button></div>
+  </aside>
+
+  <!-- ============ STAGE ============ -->
+  <main id="stage">
+    <div id="preview">
+      <div class="frame" id="frame">
+        <div class="mock">
+          <div class="kicker" id="pv-kicker">FABLE · TAKE V3</div>
+          <h1 id="pv-title">Product Reveal</h1>
+        </div>
+        <button class="playbtn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#e2e8f0"><path d="M8 5v14l11-7z"/></svg>
+        </button>
+        <span class="tc" id="pv-tc">00:42.10 · frame 2526</span>
+        <div class="ab"><button class="on" id="abA">A · v3</button><button id="abB">B · v2</button></div>
+      </div>
+    </div>
+
+    <div id="takes">
+      <div class="takes-inner">
+        <span class="takes-label">TAKES</span>
+        <div id="takestrip" style="display:flex;gap:10px;overflow-x:auto"></div>
+        <div class="take-new" id="revise">＋<span>Revise…</span></div>
+      </div>
+    </div>
+
+    <div id="timeline">
+      <div class="tl-head">
+        <span class="tl-title">TIMELINE</span>
+        <span class="tl-hint">edges snap to <b>transcript words</b> · drag playhead to scrub</span>
+        <div class="zoom"><button class="btn ghost">−</button><button class="btn ghost">＋</button></div>
+      </div>
+      <div id="ruler"></div>
+      <div id="lanes">
+        <div class="lane" id="lane-cutaway"><span class="lane-label">CUTAWAY</span></div>
+        <div class="lane" id="lane-overlay"><span class="lane-label">OVERLAY</span></div>
+        <div id="playhead" style="left:46.8%"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ============ INSPECTOR ============ -->
+  <aside id="insp"><div class="insp-empty">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="1.6"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/></svg>
+    <div>Select a scene<br>to inspect and revise it</div>
+  </div></aside>
+
+  <!-- ============ FOOTER ============ -->
+  <footer id="foot">
+    <span><b>Space</b>Play</span><span><b>I</b>/<b>O</b>Trim to playhead</span>
+    <span><b>←→</b>Snap to prev/next word</span><span><b>V</b>Takes</span>
+    <span><b>B</b>Preview bake range</span><span><b>D</b>Disable scene</span>
+    <span class="right">All timing edits are word-snapped · Saves are backed up + etag-guarded</span>
+  </footer>
+</div>
+
+<!-- ============ DESIGN NOTES ============ -->
+<button id="notesbtn" title="Toggle design rationale">?</button>
+<div class="note" style="top:56px;left:270px"><span class="n">1</span><b>One selection model.</b> Click a scene anywhere — list or timeline — and the preview, takes drawer, and inspector all follow. Nothing else on screen changes.</div>
+<div class="note" style="top:38%;right:300px;max-width:230px"><span class="n">2</span><b>The preview is the app.</b> Everything orbits it. Jobs, saves and bake live in the top bar as state, not as panels.</div>
+<div class="note" style="bottom:210px;left:34%"><span class="n">3</span><b>Takes drawer between preview and timeline.</b> Versions belong to the selected scene, so they appear at the moment of selection and nowhere else. Hover a take: Compare / Promote.</div>
+<div class="note" style="bottom:120px;left:80px"><span class="n">4</span><b>Words on the ruler.</b> The violet ticks are transcript words. Edges snap to them — this pipeline syncs visuals to speech, so the timeline speaks the same language.</div>
+<div class="note" style="top:120px;left:20px;max-width:220px"><span class="n">5</span><b>Status is a filter, not a hunt.</b> "Blocking bake" shows exactly what stops a render: missing assets, disabled scenes, generating jobs.</div>
+<div class="note" style="bottom:180px;right:20px;max-width:230px"><span class="n">6</span><b>Revise lives on the scene.</b> The primary action re-opens the take's generation spec with your notes. New takes arrive in the drawer as candidates — nothing is overwritten, ever.</div>
+
+<script>
+/* ================= MOCK DATA (mirrors scene.schema.json) ================= */
+const DUR = 90;
+const WORDS = [4.2,4.6,5.0,5.5,6.1,6.4,7.0,7.8,8.3,9.0,10.2,11.0,12.4,13.1,14.0,15.2,16.8,17.5,18.9,20.1,21.4,22.8,24.0,25.5,26.9,28.2,29.8,31.0,32.4,33.9,35.1,36.6,38.0,39.4,40.8,42.1,43.5,44.9,46.2,47.6,48.6,50.0,51.3,52.7,54.1,55.4,56.8,58.2,59.5,60.9,62.3,63.6,65.0,66.4,67.7,69.1,70.5,71.8,73.2,74.6,75.9,77.3,78.7,80.0,81.4,82.8,84.1,85.5,86.9,88.2];
+const SCENES = [
+ {id:"HookStatement", engine:"remotion", type:"cutaway", in_s:4.2, out_s:9.0, status:"approved",
+  cue:"cold open — 'stop editing videos by hand'", active:"v1",
+  versions:[{vid:"v1",who:"remotion",cost:null,note:"kit BigStatement"}],
+  props:{headline:"Stop editing by hand", accent:"#6366f1", pace:"punchy"}},
+ {id:"ProductReveal", engine:"fable", type:"cutaway", in_s:42.1, out_s:48.6, status:"draft",
+  cue:"'…and this is the finished result'", active:"v3",
+  versions:[
+    {vid:"v1",who:"fable",cost:0.38,note:"too fast"},
+    {vid:"v2",who:"fable",cost:0.41,note:"good light, wrong angle"},
+    {vid:"v3",who:"fable",cost:0.42,note:"keep camera subtle"},
+    {vid:"cand-a1b2",who:"fable",cost:0.44,note:"new · slower dolly",candidate:true}],
+  spec:{prompt:"slow cinematic dolly across the finished dashboard, warm dusk light", model:"veo-3.1", seed:1234, duration_s:6.5}},
+ {id:"DashboardWalkthrough", engine:"remotion", type:"cutaway", in_s:55.4, out_s:63.6, status:"approved",
+  cue:"'let me show you the dashboard'", active:"v2",
+  versions:[{vid:"v1",who:"remotion",note:"gen'd from capture"},{vid:"v2",who:"remotion",note:"retimed to 'filters'"}],
+  props:{headline:null, accent:"#6366f1", pace:"calm"}},
+ {id:"BRollCity", engine:"media", type:"cutaway", in_s:70.5, out_s:75.9, status:"planned",
+  cue:"'out in the real world…'", active:null, versions:[], blocked:true},
+ {id:"SubscribeBadge", engine:"remotion", type:"overlay", in_s:20.1, out_s:80.0, status:"approved",
+  cue:"persistent CTA, bottom band", active:"v1", versions:[{vid:"v1",who:"remotion",note:"brand badge"}], z:0}
+];
+const ENG = {remotion:"var(--ind)", fable:"var(--vio)", hyperframe:"var(--cyn)", media:"var(--slate)"};
+const THUMBS = {
+ v1:"linear-gradient(120deg,#312e81,#0f172a)", v2:"linear-gradient(120deg,#4c1d95,#111827)",
+ v3:"linear-gradient(120deg,#5b21b6,#1e1b4b)", "cand-a1b2":"linear-gradient(120deg,#713f12,#1c1917)"};
+let sel=null, filter="all", q="";
+
+/* ================= RULER ================= */
+const ruler=document.getElementById("ruler");
+for(let s=0;s<=DUR;s+=5){
+  const t=document.createElement("div");t.className="tick"+(s%15===0?" major":"");t.style.left=(s/DUR*100)+"%";ruler.appendChild(t);
+  if(s%15===0){const l=document.createElement("div");l.className="tick-label";l.style.left=(s/DUR*100)+"%";l.textContent="0:"+String(s).padStart(2,"0");ruler.appendChild(l);}
+}
+WORDS.forEach(w=>{const t=document.createElement("div");t.className="wordtick";t.style.left=(w/DUR*100)+"%";ruler.appendChild(t);});
+
+/* ================= RENDER: list + lanes ================= */
+function statusOf(s){ if(s.blocked) return "blocked"; return s.status; }
+function renderList(){
+  const el=document.getElementById("scenelist"); el.innerHTML="";
+  SCENES.filter(s=>{
+    if(q && !s.id.toLowerCase().includes(q)) return false;
+    if(filter==="all") return true;
+    if(filter==="blocking") return s.blocked || s.status==="generating";
+    return s.engine===filter;
+  }).forEach(s=>{
+    const d=document.createElement("div"); d.className="scard"+(sel===s.id?" sel":"");
+    d.innerHTML=`<span class="eng" style="background:${ENG[s.engine]}"></span>
+      <span class="meta"><span class="name">${s.id}</span>
+      <span class="sub">${fmt(s.in_s)} – ${fmt(s.out_s)} · ${s.type}</span></span>
+      <span class="status st-${statusOf(s)}">${statusOf(s)}</span>`;
+    d.onclick=()=>select(s.id); el.appendChild(d);
+  });
+}
+function renderLanes(){
+  ["cutaway","overlay"].forEach(t=>{
+    const lane=document.getElementById("lane-"+t);
+    lane.querySelectorAll(".block").forEach(b=>b.remove());
+    SCENES.filter(s=>s.type===t).forEach(s=>{
+      const b=document.createElement("div");
+      b.className="block"+(sel===s.id?" sel":"")+(s.blocked?" blocked":"")+(s.status==="disabled"?" disabled":"");
+      b.style.left=(s.in_s/DUR*100)+"%"; b.style.width=((s.out_s-s.in_s)/DUR*100)+"%";
+      b.innerHTML=`<span class="engstripe" style="background:${ENG[s.engine]}"></span>
+        <span class="edge l"></span><span class="bstat" style="background:${s.blocked?'var(--red)':s.status==='approved'?'var(--grn)':'var(--amb)'}"></span>
+        <span class="bname">${s.id}</span><span class="edge r"></span>`;
+      b.onclick=()=>select(s.id); lane.appendChild(b);
+    });
+  });
+}
+function fmt(t){const m=Math.floor(t/60),s=(t%60).toFixed(1).padStart(4,"0");return m+":"+s}
+
+/* ================= SELECTION → inspector + takes + preview ================= */
+function select(id){
+  sel=id; const s=SCENES.find(x=>x.id===id);
+  renderList(); renderLanes();
+  document.getElementById("pv-title").textContent=s.id.replace(/([A-Z])/g," $1").trim();
+  document.getElementById("pv-kicker").textContent=(s.engine+" · "+(s.active?("take "+s.active):"no take yet")).toUpperCase();
+  // takes
+  const strip=document.getElementById("takestrip"); strip.innerHTML="";
+  s.versions.forEach(v=>{
+    const t=document.createElement("div");
+    t.className="take"+(v.vid===s.active?" active activeBadge":"")+(v.candidate?" candidate":"");
+    t.innerHTML=`<div class="thumb" style="background:${THUMBS[v.vid]||THUMBS.v1}"></div>
+      <span class="tag">${v.vid}</span><span class="who" style="background:${ENG[v.who]||ENG.remotion}"></span>
+      <div class="foot"><span class="cost">${v.cost?("$"+v.cost.toFixed(2)):""}</span>
+      <span class="act"><button onclick="compare(event,'${s.id}','${v.vid}')">Compare</button>
+      <button class="pro" onclick="promote(event,'${s.id}','${v.vid}')">Promote</button></span></div>`;
+    t.title=v.note||""; strip.appendChild(t);
+  });
+  document.getElementById("takes").classList.toggle("open", s.versions.length>0 || s.engine!=="remotion");
+  // inspector
+  const insp=document.getElementById("insp");
+  insp.innerHTML=`
+   <div class="insp-head">
+     <div class="name"><span class="eng" style="background:${ENG[s.engine]}"></span>${s.id}
+       <span class="status st-${statusOf(s)}" style="margin-left:auto">${statusOf(s)}</span></div>
+     <div class="idline">${s.type} · ${s.versions.length} take${s.versions.length===1?"":"s"} · active ${s.active||"—"}</div>
+   </div>
+   <div class="sec"><h4>Timing — word-synced</h4>
+     <div class="row"><label>In</label><input class="mini" value="${fmt(s.in_s)}"><button class="snap">⇤ word</button></div>
+     <div class="row"><label>Out</label><input class="mini" value="${fmt(s.out_s)}"><button class="snap">word ⇥</button></div>
+     <div class="row"><label>Cue</label><input value="${s.cue}"></div>
+     <div class="row"><label>Fit</label><select><option>hold last frame</option><option>cut</option><option>stretch</option><option>error</option></select></div>
+   </div>
+   ${s.props?`<div class="sec"><h4>Props — from composition schema</h4>
+     ${s.props.headline!==undefined&&s.props.headline!==null?`<div class="row"><label>Headline</label><input value="${s.props.headline}"></div>`:""}
+     <div class="row"><label>Accent</label><input type="color" value="${s.props.accent}" style="padding:2px;height:30px"></div>
+     <div class="row"><label>Pace</label><select><option${s.props.pace==="calm"?" selected":""}>calm</option><option${s.props.pace==="punchy"?" selected":""}>punchy</option></select></div>
+     <div class="props-note">These controls are generated from the composition's <b>propsSchema</b> — no TSX editing.</div>
+   </div>`:""}
+   ${s.spec?`<div class="sec"><h4>Generation spec — provenance</h4>
+     <div class="row"><label>Prompt</label><textarea rows="2">${s.spec.prompt}</textarea></div>
+     <div class="row"><label>Model</label><input class="mini" value="${s.spec.model}"></div>
+     <div class="row"><label>Seed</label><input class="mini" value="${s.spec.seed}"></div>
+   </div>`:""}
+   ${s.blocked?`<div class="sec"><h4 style="color:var(--red)">Blocking bake</h4>
+     <div class="props-note">No asset yet. Import a take or send a generation job — the scene stays planned and bake skips it until a take is promoted.</div></div>`:""}
+   <div class="insp-actions">
+     <button class="btn primary">${s.engine==="remotion"?"Re-render take":"Revise → new take"}</button>
+     <div class="rowbtns"><button class="btn">Preview bake ±2s</button><button class="btn">Render frame</button></div>
+     <div class="rowbtns"><button class="btn ghost">Duplicate</button><button class="btn ghost">Disable</button><button class="btn ghost" style="color:var(--red)">Delete</button></div>
+   </div>`;
+}
+function promote(e,id,vid){e.stopPropagation();const s=SCENES.find(x=>x.id===id);s.active=vid;s.versions.forEach(v=>{if(v.vid===vid)delete v.candidate});select(id);flash("Promoted "+vid+" — timeline asset updated, save pending");}
+function compare(e,id,vid){e.stopPropagation();document.getElementById("frame").classList.add("comparing");document.getElementById("abB").textContent="B · "+vid;flash("Comparing active vs "+vid+" — press A/B or hold to flip");}
+function flash(msg){const c=document.getElementById("savechip");c.innerHTML=`<span class="dot warn"></span>${msg}`;setTimeout(()=>c.innerHTML=`<span class="dot ok"></span>Saved · <span class="mini">etag 8f31c2</span>`,2600);}
+
+/* ================= misc wiring ================= */
+document.getElementById("q").oninput=e=>{q=e.target.value.toLowerCase();renderList();};
+document.querySelectorAll(".fchip").forEach(f=>f.onclick=()=>{document.querySelectorAll(".fchip").forEach(x=>x.classList.remove("on"));f.classList.add("on");filter=f.dataset.f;renderList();});
+const ph=document.getElementById("playhead");let dragging=false;
+ph.onmousedown=()=>dragging=true;window.onmouseup=()=>dragging=false;
+window.onmousemove=e=>{if(!dragging)return;const r=document.getElementById("lanes").getBoundingClientRect();let x=Math.min(Math.max(e.clientX-r.left,0),r.width);ph.style.left=(x/r.width*100)+"%";const t=x/r.width*DUR;document.getElementById("clock").innerHTML=fmt(t).padStart(7,"0")+" <span>/ 01:30.00</span>";document.getElementById("pv-tc").textContent=fmt(t)+" · frame "+Math.round(t*60);};
+document.getElementById("abA").onclick=e=>{e.target.classList.add("on");document.getElementById("abB").classList.remove("on");};
+document.getElementById("abB").onclick=e=>{e.target.classList.add("on");document.getElementById("abA").classList.remove("on");};
+document.getElementById("notesbtn").onclick=()=>document.body.classList.toggle("shownotes");
+document.getElementById("revise").onclick=()=>flash("Revise: spec prefilled from active take → submit = new candidate in drawer");
+
+renderList(); renderLanes(); select("ProductReveal");
+</script>
+</body>
+</html>

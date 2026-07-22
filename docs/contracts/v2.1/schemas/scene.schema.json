@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workbench/scene.schema.json",
+  "title": "Scene v2.1 — timeline.json shots[] entry (placement identity split from render identity)",
+  "type": "object",
+  "required": ["scene_uid", "type", "master_in_s", "master_out_s"],
+  "properties": {
+    "scene_uid": { "type": "string", "pattern": "^scn_[A-Za-z0-9]{8,32}$", "description": "Placement identity, server-generated, never reused." },
+    "engine": { "enum": ["remotion", "fable", "hyperframe", "media"], "default": "remotion" },
+    "composition_id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*$", "description": "Remotion render source (PascalCase). Present iff engine=remotion. Many scenes may share one." },
+    "type": { "enum": ["cutaway", "overlay"] },
+    "master_in_s": { "type": "number", "minimum": 0 },
+    "master_out_s": { "type": "number", "exclusiveMinimum": 0 },
+    "cue": { "type": "string" },
+    "enabled": { "type": "boolean", "default": true },
+    "status": { "enum": ["planned", "generating", "draft", "approved"], "default": "planned" },
+    "z": { "type": "integer", "default": 0, "description": "overlays only; low renders first" },
+    "transition_in": {
+      "type": "object", "required": ["kind"],
+      "properties": { "kind": { "enum": ["cut", "xfade"] }, "frames": { "type": "integer", "minimum": 1, "maximum": 60 } },
+      "description": "Owns exactly the same-lane overlap it needs; validator permits overlap only where an xfade claims it."
+    },
+    "fit": { "enum": ["hold", "cut", "stretch", "error"], "default": "hold" },
+    "props": { "type": "object", "description": "engine=remotion only: values for the composition's propsSchema, passed via --props" },
+    "active_take_uid": { "type": ["string", "null"], "pattern": "^take_[A-Za-z0-9]{8,32}$", "description": "null = no take yet (planned)" },
+    "takes": {
+      "type": "array",
+      "description": "APPEND-ONLY immutable takes. Each item validates against take.schema.json.",
+      "items": { "$ref": "take.schema.json#" }
+    },
+    "notes": { "type": "string" },
+
+    "id": { "type": "string", "description": "LEGACY, DERIVED on save: composition_id when engine=remotion else scene_uid. Never read by new code; kept so bake.py and legacy tools run unchanged." },
+    "asset": { "type": "string", "description": "LEGACY, DERIVED on save: file of the active take, project-relative. Never hand-edited once takes[] is non-empty." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "engine": { "const": "remotion" } }, "required": ["engine"] },
+      "then": { "required": ["composition_id"] }
+    }
+  ]
+}

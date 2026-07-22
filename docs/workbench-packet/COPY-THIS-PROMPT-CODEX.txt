@@ -1,0 +1,27 @@
+You are implementing the Fable 5 handback packet for the AI video workbench.
+
+Read README.md, then work in this exact order:
+
+1. REBUILD THE UI SHELL per ui-redesign/. Ground truth is mockup.html (open it, interact with it,
+   press ? for rationale); DESIGN-SPEC.md is the contract; design-tokens.css is copied verbatim.
+   Acceptance = the "five rules" in DESIGN-SPEC.md hold, the keyboard row works, and the
+   "Blocking bake" filter returns exactly the scenes bake would skip. Keep vanilla HTML/CSS/JS.
+   Refactor scene-editor.js into one store + one render pass; kill every second selection source.
+   Preserve all existing server endpoints; this step changes the client only (plus serving
+   transcript word starts for ruler ticks if not already exposed).
+
+2. IMPLEMENT specs/SLICE-1-SPEC.md (immutable takes, ingest-conform, promote, range bake).
+   Adopt schemas/scene.schema.json and schemas/job.schema.json exactly; they are additive over
+   the current timeline.json bake contract — bake.py continues reading id/type/master_in_s/
+   master_out_s/asset/enabled unchanged.
+
+3. FIX the SEV-1 items in review/01-FINDINGS.md while touching the same files:
+   etag-guarded timeline saves (409 on mismatch, never silent overwrite), file-backed job
+   records with orphan reaping, and write-once hash-named version files.
+
+Constraints: preserve the working Remotion + timeline.json pipeline; no new UI frameworks; no new
+hard Python deps; Windows + POSIX paths both work; every new behavior gets a unit test in
+tools/editor/test_server.py.
+
+Report back with: what you built, deviations from the spec and why, test results, and a screenshot
+of the rebuilt UI next to mockup.html.

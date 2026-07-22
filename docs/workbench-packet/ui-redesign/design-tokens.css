@@ -1,0 +1,52 @@
+/* Workbench design tokens — copy verbatim; keep in sync with mockup.html */
+:root {
+  /* canvas + surfaces (near-black blue, calm) */
+  --bg0: #0a0c10;   /* app canvas */
+  --bg1: #10131a;   /* panels: library, inspector, top bar, timeline */
+  --bg2: #151924;   /* raised: cards, chips, inputs-on-panel */
+  --bg3: #1c2130;   /* highest: active segment, block fill, kbd keys */
+
+  /* hairlines */
+  --line:  rgba(148,163,184,.09);
+  --line2: rgba(148,163,184,.20);
+
+  /* text */
+  --txt:  #e2e8f0;  /* primary */
+  --txt2: #94a3b8;  /* secondary */
+  --txt3: #64748b;  /* tertiary, labels, hints */
+
+  /* accent — matches the repo's house brand */
+  --ind: #6366f1;  --ind-soft: rgba(99,102,241,.14);
+
+  /* engines */
+  --eng-remotion: #6366f1;
+  --eng-fable: #a78bfa;
+  --eng-hyperframe: #22d3ee;
+  --eng-media: #64748b;
+
+  /* status */
+  --ok: #34d399;     /* approved */
+  --warn: #fbbf24;   /* draft / candidate */
+  --danger: #f87171; /* blocked / destructive / playhead */
+
+  /* shape + depth */
+  --r1: 6px; --r2: 10px; --r3: 14px;
+  --shadow: 0 8px 28px rgba(0,0,0,.45);
+
+  /* type */
+  --sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  /* sizes: 9.5 label-caps · 10.5 hint · 11.5 chip · 13 body · 15 clock */
+
+  /* spacing: 4px grid — use 4/8/12/16/24 only */
+}
+
+/* primitives */
+.btn { padding: 7px 14px; border-radius: var(--r1); border: 1px solid var(--line2);
+       background: var(--bg2); font-weight: 600; font-size: 12px; }
+.btn.primary { background: var(--ind); border-color: var(--ind); color: #fff; }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px;
+        padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line);
+        background: var(--bg2); color: var(--txt2); }
+.label-caps { font-size: 9.5px; font-weight: 700; letter-spacing: .16em;
+              color: var(--txt3); text-transform: uppercase; }

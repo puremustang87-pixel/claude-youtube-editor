@@ -1,0 +1,294 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workbench/editplan.schema.json",
+  "title": "edit-plan.json — the approvable, executable edit plan (videos/<project>/work/edit-plan.json)",
+  "description": "The centerpiece. Built by the planner from the script, the VO alignment (script-map.json), the asset catalog (assets.json), and the editing brain (brain/EDITING-BRAIN.md). The owner approves it scene-by-scene or wholesale; approval freezes a revision (append-only). The execution compiler reads the approved revision and emits timeline.json (scene.schema.json shots), an sfx-plan.json, and a music mix invocation. A human-readable mirror, edit-plan.md, is regenerated on every write because make-tsx already reads edit-plan.md as its source of truth.",
+  "type": "object",
+  "required": ["project", "schema_version", "mode", "rev", "status", "created_at", "master", "scenes"],
+  "additionalProperties": false,
+  "properties": {
+    "project": { "type": "string" },
+    "schema_version": { "const": 1 },
+    "mode": {
+      "enum": ["vo_script", "talking_head"],
+      "description": "vo_script = the drop-folder mode (script + VO narration, no talking head); talking_head = the sibling mode that already has clean-cut/make-tsx. This schema serves both; in talking_head mode `master` is the recorded cut and vo_span refers to edited-transcript spans."
+    },
+    "rev": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Revision number. Bumped on every FROZEN approval. Revisions are append-only: rev N is written to work/plan-revs/edit-plan.rev-N.json before rev N+1 is generated. Mirrors the versions philosophy."
+    },
+    "parent_rev": {
+      "type": ["integer", "null"],
+      "description": "The rev this one was derived from (owner edited rev 2 -> produced rev 3). null for the first plan."
+    },
+    "status": {
+      "enum": ["draft", "in_review", "approved", "superseded"],
+      "description": "draft=planner still writing; in_review=presented at the approval gate, owner acting per scene; approved=frozen, compiler may run; superseded=a newer rev was frozen."
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "approved_at": { "type": ["string", "null"], "format": "date-time" },
+    "brain_ref": {
+      "type": "string",
+      "default": "brain/EDITING-BRAIN.md",
+      "description": "The editing-brain rulebook the planner consumed (pacing, coverage, treatment-selection, sound taste). Authored by a separate expert; the planner READS it, it is not defined here."
+    },
+    "sources": {
+      "type": "object",
+      "description": "The upstream artifacts this plan was built from, for provenance + staleness checks (if an input's sha changes, the plan is stale).",
+      "additionalProperties": false,
+      "properties": {
+        "script": { "type": "string", "description": "sha256 of the resolved script file" },
+        "script_map": { "type": "string", "description": "path to script-map.json" },
+        "assets_catalog": { "type": "string", "description": "path to assets.json" },
+        "vo_primary_sha": { "type": "string", "description": "sha256 of the VO take chosen as the master narration" }
+      }
+    },
+    "master": {
+      "type": "object",
+      "description": "How the bake master is constructed. In vo_script mode there is NO talking-head video, so the master is SYNTHESIZED (VO audio + a base video track) BEFORE bake so bake.py's contract (mux master audio, pass-through master video in the gaps) holds unchanged. See PIPELINE-DESIGN.md section on the VO-mode master.",
+      "required": ["kind", "audio", "fps", "duration_s"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["vo_synth", "recorded_cut"],
+          "description": "vo_synth = compiler builds master.mp4 = [VO audio] + [base video track]; recorded_cut = talking_head mode, the clean-cut master."
+        },
+        "audio": {
+          "type": "string",
+          "description": "vo_synth: the picked/assembled VO track (the primary narration). recorded_cut: the master's own audio (this field then just records identity)."
+        },
+        "base_track": {
+          "type": "object",
+          "description": "vo_synth only: the video that shows through wherever no cutaway covers the timeline (bake pass-through segments read master video here). Keeps bake.py unmodified — the master is a normal A/V file.",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": ["brand_slate", "primary_broll", "color", "ambient_loop"],
+              "description": "brand_slate = branded holding card (BrandBg/BrandProof-style, rendered once); primary_broll = a chosen wide/calm clip looped/held; color = flat brand color; ambient_loop = a slow-motion texture. Default per brain: brand_slate. This is the ONLY thing the owner sees in un-covered gaps, so treatment aims to cover most of the timeline."
+            },
+            "asset_sha": { "type": ["string", "null"], "description": "if kind=primary_broll: the source asset's sha256 from assets.json" },
+            "note": { "type": "string" }
+          }
+        },
+        "fps": { "type": "integer", "description": "comp fps (30 for preview per the kit)" },
+        "duration_s": { "type": "number", "description": "total VO/master length; equals the last scene's vo_span end" }
+      }
+    },
+    "music": {
+      "type": "object",
+      "description": "Video-level music bed intent. The compiler turns this into a tools/mix_music.py invocation over the SFX'd bake. Per-scene section intent lives in each scene.sound.music_section.",
+      "additionalProperties": false,
+      "properties": {
+        "bed_id": { "type": ["string", "null"], "description": "id from media/library/music/catalog.json (e.g. ambient-pad, tech-pulse). null = no bed." },
+        "bed_gain_db": { "type": "number", "default": -7 },
+        "duck_db": { "type": "number", "default": 9, "description": "extra dB the bed drops under the VO (mix_music.py --duck). Sidechain keyed by the VO+SFX bus." },
+        "fade_s": { "type": "number", "default": 1.5 }
+      }
+    },
+    "scenes": {
+      "type": "array",
+      "description": "The ordered plan. One scene per script beat (a beat may be a paragraph or a sentence group, per the aligner + brain). Scene order == render order.",
+      "items": { "$ref": "#/definitions/scene" }
+    },
+    "warnings": {
+      "type": "array",
+      "description": "Planner-surfaced issues the owner should see at the gate (coverage gaps, low-confidence alignment, VO ad-libs off-script). Non-blocking; informational.",
+      "items": {
+        "type": "object",
+        "required": ["scene_id", "kind", "message"],
+        "properties": {
+          "scene_id": { "type": "string" },
+          "kind": { "enum": ["no_coverage", "weak_coverage", "alignment_low_confidence", "vo_off_script", "duration_mismatch", "duplicate_asset_use"] },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "scene": {
+      "type": "object",
+      "required": ["id", "beat", "vo_span", "intent", "treatment", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9-]*$",
+          "description": "Stable scene identity, carried verbatim into timeline.json scenes[].id and into remotion comp names (PascalCase when a Remotion beat)."
+        },
+        "order": { "type": "integer", "minimum": 0, "description": "Explicit render order; ties broken by array position." },
+        "beat": {
+          "type": "object",
+          "required": ["text", "script_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "text": { "type": "string", "description": "The script beat's prose, verbatim. This is what the owner reads at the approval gate and what the matcher tokenizes against asset tags." },
+            "script_ref": {
+              "type": "object",
+              "description": "Where in the script this beat came from (for round-trip edits).",
+              "additionalProperties": false,
+              "properties": {
+                "para_index": { "type": "integer" },
+                "char_start": { "type": "integer" },
+                "char_end": { "type": "integer" }
+              }
+            },
+            "title": { "type": "string", "description": "Short human label for the scene card at the gate, e.g. 'Hook: the 4am problem'." }
+          }
+        },
+        "vo_span": {
+          "type": "object",
+          "description": "Where this beat lands on the VO/master timeline, from script-map.json. The scene's on-timeline duration = end_ms - start_ms; cutaways for this scene are placed inside this span.",
+          "required": ["start_ms", "end_ms"],
+          "additionalProperties": false,
+          "properties": {
+            "start_ms": { "type": "integer", "minimum": 0 },
+            "end_ms": { "type": "integer", "exclusiveMinimum": 0 },
+            "align_confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "fuzzy-alignment score of beat->transcript. Low => an 'alignment_low_confidence' warning and a nudgeable span at the gate." },
+            "vo_take_sha": { "type": "string", "description": "which VO take this span is measured against (supports per-section takes / retakes)." }
+          }
+        },
+        "intent": {
+          "enum": ["hook", "explain", "demo", "payoff", "cta", "transition", "recap"],
+          "description": "The beat's narrative job, inferred from position + script cues + brain rules. Drives treatment and sound taste (a hook and a cta are sounded differently)."
+        },
+        "coverage": {
+          "type": "array",
+          "description": "Ranked candidate assets for this beat, best first. Produced by the matcher: score = token overlap (beat.text tokens vs asset filename/folder/tags) + duration fit (asset dur vs vo_span dur) + class fit (does the beat want a clip/image/screencast?). The chosen one is referenced by treatment; the rest are alternates the owner can swap to at the gate (they become candidate takes downstream).",
+          "items": {
+            "type": "object",
+            "required": ["asset_sha", "score"],
+            "additionalProperties": false,
+            "properties": {
+              "asset_sha": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "score": { "type": "number", "minimum": 0, "maximum": 1 },
+              "reasons": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Legible match reasons for the gate, e.g. ['tag:dashboard matches beat', 'dur 6.2s fits 5.8s span', 'class:broll fits demo']."
+              },
+              "chosen": { "type": "boolean", "default": false, "description": "true for the single asset the treatment currently uses." }
+            }
+          }
+        },
+        "treatment": {
+          "type": "object",
+          "description": "HOW this beat is realized on screen. Exactly one `kind`. A GAP (kind=generate) is FIRST-CLASS: a scene with no matching asset gets kind=generate + a prefilled prompt derived from beat.text, and stays status=planned until a take exists. The compiler wires generate treatments to the existing provider/courier system (work/inbox + jobs), it does not invent generation.",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": ["broll_cutaway", "image_kenburns", "screencast", "remotion_beat", "generate", "base_only"],
+              "description": "broll_cutaway=a camera clip replaces the base video for the span; image_kenburns=a still via the kit's ImageRevealShot (slow scale/opacity, the existing 'ken burns'); screencast=a screen-capture clip or a fake-screencast TSX; remotion_beat=an authored kit shot (statement/diagram/UI clone) built by make-tsx; generate=GAP, hand off to Remotion/Hyperframe courier with `prompt`; base_only=no cutaway, the base track carries the beat (used for pure-narration transitions)."
+            },
+            "engine": {
+              "enum": ["media", "remotion", "fable", "hyperframe"],
+              "description": "Which engine produces the take. media=an ingested clip/image (broll_cutaway/image_kenburns/screencast); remotion=an authored/kit beat; fable|hyperframe=generation providers for GAPS. Carried into scene.schema.json `engine`."
+            },
+            "asset_sha": {
+              "type": ["string", "null"],
+              "description": "For media treatments: the chosen asset (== the coverage entry with chosen:true). null for generate (until fulfilled) and remotion_beat (comp, not asset)."
+            },
+            "comp": {
+              "type": ["string", "null"],
+              "description": "For remotion_beat: the Remotion composition id (e.g. ImageRevealShot, LevelTitleShot, or a to-be-authored shot). make-tsx builds it; the compiler records the id."
+            },
+            "props": {
+              "type": "object",
+              "description": "For remotion_beat: values for the comp's propsSchema (passed to bake via scene.props). e.g. {title, subtitle, color, src}."
+            },
+            "kenburns": {
+              "type": "object",
+              "description": "For image_kenburns: the move. Maps onto ImageRevealShot / a pan-zoom.",
+              "additionalProperties": false,
+              "properties": {
+                "from": { "type": "array", "items": { "type": "number" }, "description": "[scale, x, y] start" },
+                "to": { "type": "array", "items": { "type": "number" }, "description": "[scale, x, y] end" }
+              }
+            },
+            "prompt": {
+              "type": ["string", "null"],
+              "description": "For generate GAPS: the prefilled generation prompt, DERIVED from beat.text + intent + brand, editable at the gate. This is what the provider/courier `spec.prompt` receives. Example seed: '<beat.text> — cinematic b-roll, <brand look>, 6s, no text'."
+            },
+            "provider_hint": {
+              "enum": ["remotion", "hyperframe", "fable", "either"],
+              "description": "For generate: which courier to prefer ('scene 5 needs something -> Remotion or Hyperframe or both'). 'either' lets the owner pick at the gate; 'both' is expressed by requesting candidates from each."
+            },
+            "duration_s": { "type": "number", "description": "Intended on-screen duration; defaults to the vo_span length. The compiler sets fit policy if the take's real duration differs." },
+            "fit": {
+              "enum": ["hold", "cut", "stretch", "error"],
+              "default": "hold",
+              "description": "Carried into scene.schema.json `fit`: what to do if the take duration != span duration."
+            }
+          }
+        },
+        "sound": {
+          "type": "object",
+          "description": "The beat's sound intent. The compiler splits this into (a) sfx-plan.json events (per the existing suggest-sfx grammar) and (b) music-section shaping. NOT a mixer here — it declares intent that the existing mix_sfx.py / mix_music.py execute.",
+          "additionalProperties": false,
+          "properties": {
+            "music_section": {
+              "enum": ["intro", "build", "steady", "breath", "outro", "silence"],
+              "description": "How the bed should behave under this beat (breath=let it come up in a gap; silence=duck to nothing). Advisory to the final music mix; the video-level bed is one continuous track ducked by VO."
+            },
+            "sfx": {
+              "type": "array",
+              "description": "SFX cues for this beat, in the suggest-sfx vocabulary. The compiler rebases `at` (scene-relative or word-anchored) to absolute master `at_s` and emits sfx-plan.json events. Library-first: sfx_id must resolve in media/library/sfx/catalog.json (or become a palette recipe).",
+              "items": {
+                "type": "object",
+                "required": ["function"],
+                "additionalProperties": false,
+                "properties": {
+                  "function": {
+                    "enum": ["motion", "tension", "emphasis", "snap"],
+                    "description": "The suggest-sfx function-first grammar: motion=whoosh, tension=riser, emphasis=impact/pop, snap=click. The brain/suggest-sfx picks the concrete sfx_id."
+                  },
+                  "sfx_id": { "type": "string", "description": "Concrete library id (e.g. whoosh-soft, pop-reveal). Optional at plan time; resolved at compile per library-first." },
+                  "anchor": {
+                    "type": "object",
+                    "description": "Where the cue lands. Either a word (preferred, from script-map/transcript) or a scene-relative offset or a treatment moment.",
+                    "additionalProperties": false,
+                    "properties": {
+                      "word": { "type": "string", "description": "the narration word to hit (a pop on 'boom')" },
+                      "at_scene_ms": { "type": "integer", "description": "ms from scene start" },
+                      "on": { "enum": ["scene_in", "scene_out", "reveal"], "description": "the treatment moment (cut-in whoosh, reveal pop)" }
+                    }
+                  },
+                  "gain_db": { "type": "number", "description": "relative to the clip's normalized level; brain/short-form calibration applies. Optional; suggest-sfx defaults fill in." },
+                  "layer": { "type": "boolean", "default": false, "description": "part of a build-and-drop hero moment (riser->impact). Only the 2-3 biggest beats." },
+                  "optional": { "type": "boolean", "default": false, "description": "deniable texture; carried to sfx-plan event.optional." }
+                }
+              }
+            },
+            "duck": { "type": "boolean", "default": true, "description": "duck SFX/music under the VO for this beat." }
+          }
+        },
+        "pacing": {
+          "type": "object",
+          "description": "Pacing notes for this beat, consumed by the brain-guided compiler when deciding cut density and hold vs. cut of the cutaway inside the span.",
+          "additionalProperties": false,
+          "properties": {
+            "energy": { "enum": ["low", "medium", "high"], "description": "brain-inferred; hooks/payoffs high, explains medium, breaths low." },
+            "min_hold_ms": { "type": "integer", "description": "shortest a single cutaway should stay up (avoid strobing)." },
+            "note": { "type": "string" }
+          }
+        },
+        "status": {
+          "enum": ["planned", "ready", "approved", "blocked"],
+          "description": "planned=treatment chosen but no take yet (all GAPS start here; also media scenes before conform); ready=a take exists / comp authored, executable; approved=owner confirmed this scene at the gate; blocked=would break the bake (missing asset, unfulfilled GAP at execute time). Maps onto scene.schema.json status {planned,generating,draft,approved} at compile (approved plan scenes with a take -> draft; GAP still open -> planned)."
+        },
+        "approval": {
+          "type": "object",
+          "description": "Per-scene approval record for the gate (owner approves/edits per scene or wholesale).",
+          "additionalProperties": false,
+          "properties": {
+            "approved": { "type": "boolean", "default": false },
+            "approved_at": { "type": ["string", "null"], "format": "date-time" },
+            "edited_fields": { "type": "array", "items": { "type": "string" }, "description": "which fields the owner changed from the planner's proposal (e.g. ['treatment.asset_sha','vo_span.end_ms'])." }
+          }
+        },
+        "notes": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workbench/take.schema.json",
+  "title": "Take — one immutable rendered/imported artifact belonging to a scene",
+  "type": "object",
+  "required": ["take_uid", "file", "sha256", "created_at", "conform_profile", "provenance"],
+  "properties": {
+    "take_uid": { "type": "string", "pattern": "^take_[A-Za-z0-9]{8,32}$" },
+    "file": {
+      "type": "string",
+      "description": "Project-relative, inside the canonical namespace: videos/<project>/work/generated/<scene_uid>/<take_uid>/asset.<ext>. Create-exclusive; never overwritten.",
+      "pattern": "^(?!/)(?!.*\\.\\.)(?!.*^[A-Za-z]:).*work/generated/scn_[A-Za-z0-9]{8,32}/take_[A-Za-z0-9]{8,32}/asset\\.[A-Za-z0-9]+$"
+    },
+    "source_file": { "type": "string", "description": "Optional preserved original upload beside the conformed artifact (source.<ext>)" },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$", "description": "Hash of the conformed artifact; identity for dedupe + integrity" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "conform_profile": {
+      "enum": ["cutaway_h264", "overlay_alpha", "image_norm", "audio_norm", "original"],
+      "description": "cutaway_h264: H.264 8-bit yuv420p comp-native · overlay_alpha: ProRes 4444 .mov alpha preserved · image_norm: metadata/dimension normalize only · audio_norm: rate/loudness pass · original: untouched (validator flags where a conformed profile is required)"
+    },
+    "probe": {
+      "type": "object",
+      "properties": {
+        "w": { "type": "integer" }, "h": { "type": "integer" },
+        "fps": { "type": "string", "description": "exact fraction, e.g. 30/1" },
+        "dur_s": { "type": "number" },
+        "alpha": { "type": "boolean" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "enum": ["remotion", "fable", "hyperframe", "media", "human"] },
+        "job_id": { "type": "string" },
+        "spec": { "type": "object", "description": "Regeneration contract (prompt/model/seed/params or composition_id+props), stored verbatim from the job" },
+        "parent_take_uid": { "type": "string", "description": "Which take this revises — the revision DAG" },
+        "note": { "type": "string" }
+      }
+    },
+    "cost_usd": { "type": ["number", "null"] },
+    "moderation": { "type": ["string", "null"] }
+  }
+}

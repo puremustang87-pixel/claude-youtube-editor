@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workbench/job.schema.json",
+  "title": "Job record — videos/<p>/work/jobs/<job_id>.json is the source of truth",
+  "type": "object",
+  "required": ["job_id", "kind", "state", "created_at", "updated_at"],
+  "properties": {
+    "job_id": { "type": "string", "pattern": "^job_[A-Za-z0-9]+$", "description": "ULID-suffixed, sortable by creation" },
+    "kind": { "enum": ["generate", "render", "bake", "ingest"] },
+    "scene_id": { "type": "string" },
+    "provider": { "enum": ["remotion", "fable", "hyperframe", "media"] },
+    "spec": { "type": "object", "description": "Copied verbatim into the winning version's provenance.spec" },
+    "state": {
+      "enum": ["queued", "submitted", "running", "awaiting_pick", "succeeded", "failed", "canceled"],
+      "description": "queued→submitted→running→(awaiting_pick when candidates>1)→succeeded | failed(retry: attempt++) | canceled(kill process group)"
+    },
+    "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+    "message": { "type": "string" },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "max_attempts": { "type": "integer", "default": 2 },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "sha256"],
+        "properties": {
+          "file": { "type": "string" },
+          "sha256": { "type": "string" },
+          "picked": { "type": "boolean", "default": false, "description": "picking promotes it to a scene version" }
+        }
+      }
+    },
+    "cost_usd": { "type": ["number", "null"] },
+    "moderation": { "type": ["string", "null"], "description": "Moderation-blocked = state failed with the verdict here, never silently dropped" },
+    "pid": { "type": ["integer", "null"], "description": "For orphan reaping on boot (match pid + start time)" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}
