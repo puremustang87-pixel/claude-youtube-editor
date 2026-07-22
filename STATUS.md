@@ -2,7 +2,7 @@
 
 **The one page that says what's real.** Updated with every merge. If it isn't reflected here and merged to `main`, it isn't real yet.
 
-_Last updated: 2026-07-22 · maintained by whoever merges_
+_Last updated: 2026-07-22 07:10 UTC+1 · maintained by whoever merges_
 
 ## How this repo works (the 10-second version)
 
@@ -17,7 +17,7 @@ Nothing reaches `main` without an owner merge. Codex builds on `codex/*` branche
 ## Merged to `main`
 
 - ✅ **Docs bridge** (`1d17a67`) — contracts v2.1, UI redesign packet, next-level pipeline, reviews. See `docs/README-BRIDGE.md`.
-- ✅ **Control Kit** (this) — STATUS.md, PR template, CI.
+- ✅ **Control Kit** (`d778c34`, `e170d66`) — STATUS.md, PR template, CI on every push.
 
 ## In review (open PRs)
 
