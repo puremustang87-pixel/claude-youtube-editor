@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Cut Editor</title>
+<title>Video Workbench</title>
+<link rel="stylesheet" href="/scene-editor.css">
 <style>
   :root {
     --bg: #16181d; --panel: #1f2229; --panel2: #262a33; --text: #d8dce4; --dim: #8a92a0;
@@ -72,24 +73,32 @@
   .ticklabel { position: absolute; top: 12px; font-size: 10px; color: var(--dim); transform: translateX(-50%); }
 </style>
 </head>
-<body>
+<body data-workspace="cut">
 <header>
-  <span class="title">✂ Cut Editor</span>
-  <span>
+  <span class="title">Video Workbench</span>
+  <nav class="workspace-tabs" aria-label="Workspace">
+    <button id="cutTab" class="active" data-workspace-tab="cut">Cut</button>
+    <button id="scenesTab" data-workspace-tab="scenes">Scenes</button>
+  </nav>
+  <span class="cut-only">
     <button id="modeBtn" title="Toggle edited / raw playback (E)">Mode: Edited</button>
     <select id="styleSel" title="Pause style for edited playback + renders">
       <option value="tight">tight</option><option value="natural">natural</option>
     </select>
   </span>
-  <span id="timeinfo" style="min-width:230px"></span>
-  <span id="editlen" style="color:var(--dim)"></span>
+  <span id="timeinfo" class="cut-only" style="min-width:230px"></span>
+  <span id="editlen" class="cut-only" style="color:var(--dim)"></span>
+  <span id="sceneTimeinfo" class="scene-only hidden"></span>
   <span class="grow"></span>
   <span id="status"></span>
-  <button id="saveBtn" disabled>💾 Save</button>
-  <button id="renderBtn" class="primary">🎬 Render preview</button>
+  <button id="saveBtn" class="cut-only" disabled>Save cut</button>
+  <button id="renderBtn" class="cut-only primary">Render cut</button>
+  <button id="sceneSaveBtn" class="scene-only hidden" disabled>Save scenes</button>
+  <button id="sceneRenderBtn" class="scene-only hidden">Render selected</button>
+  <button id="sceneBakeBtn" class="scene-only hidden primary">Bake preview</button>
 </header>
 
-<div id="main">
+<div id="main" class="workspace cut-workspace">
   <div id="left"><video id="vid" src="/media/proxy.mp4"></video></div>
   <div id="right">
     <div id="inspector" class="panel"><h3>Segment</h3><div id="inspBody">Click a block on the timeline.</div>
@@ -100,7 +109,51 @@
   </div>
 </div>
 
-<div id="tlwrap">
+<div id="sceneWorkspace" class="workspace scene-workspace hidden">
+  <aside id="sceneLibrary" class="scene-panel">
+    <div class="scene-panel-head">
+      <div>
+        <h2>Scene library</h2>
+        <p id="sceneCount" class="scene-muted">Loading Remotion compositions...</p>
+      </div>
+      <button id="sceneAddBtn" class="primary" disabled>+ Add at playhead</button>
+    </div>
+    <div class="scene-filters">
+      <input id="sceneSearch" type="search" placeholder="Search compositions">
+      <select id="sceneGroup"><option value="">All groups</option></select>
+    </div>
+    <div id="sceneCatalog" class="scene-catalog"></div>
+  </aside>
+
+  <main id="sceneStage">
+    <div class="scene-player-shell">
+      <video id="sceneVid" src="/media/proxy.mp4" controls></video>
+      <img id="sceneStill" alt="Rendered scene frame" class="hidden">
+      <div id="sceneEmptyPreview" class="scene-empty-preview">
+        Select a timeline scene, then render its current frame.
+      </div>
+    </div>
+    <div class="scene-stagebar">
+      <button id="scenePlayBtn">Play / pause</button>
+      <button id="sceneFrameBtn" disabled>Render current frame</button>
+      <span id="sceneFrameLabel" class="scene-muted"></span>
+      <span class="grow"></span>
+      <button id="sceneClearPreviewBtn" disabled>Show master</button>
+    </div>
+    <pre id="sceneJobLog" class="scene-job-log">No render job running.</pre>
+  </main>
+
+  <aside id="sceneInspector" class="scene-panel">
+    <div class="scene-panel-head">
+      <div><h2>Scene inspector</h2><p class="scene-muted">Changes write directly to timeline.json</p></div>
+    </div>
+    <div id="sceneInspectorBody" class="scene-inspector-empty">
+      Add a composition or click a scene on the timeline.
+    </div>
+  </aside>
+</div>
+
+<div id="tlwrap" class="cut-workspace">
   <div id="tlbar">
     <span>zoom <input id="zoom" type="range" min="4" max="40" value="7" style="width:120px"></span>
     <span style="color:var(--dim)">green = keep · <span style="color:var(--cut-retake)">retake</span> ·
@@ -116,6 +169,20 @@
   </div></div>
 </div>
 
+<div id="sceneTlwrap" class="scene-workspace hidden">
+  <div id="sceneTlbar">
+    <span>zoom <input id="sceneZoom" type="range" min="4" max="40" value="8"></span>
+    <span class="scene-legend"><i class="cutaway"></i> cutaway <i class="overlay"></i> overlay <i class="planned"></i> planned/disabled</span>
+    <span class="scene-muted">Drag a block to move it. Drag either edge to retime it.</span>
+  </div>
+  <div id="sceneTimeline"><div id="sceneTimelineInner">
+    <div class="scene-track-label cutaway-label">CUTAWAYS</div>
+    <div class="scene-track-label overlay-label">OVERLAYS</div>
+    <div id="sceneRuler" class="scene-ruler"></div>
+    <div id="scenePlayhead"></div>
+  </div></div>
+</div>
+
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -126,6 +193,18 @@ let events = [];            // {id, clip, s, e, kind, cat, text, note} local tim
 let selected = null, dirty = false, changes = [];
 let pps = 7;                // pixels per second
 let mode = "edited";
+// Frame-step size for , / . — fps-aware. Priority: ?fps= query param (a decimal
+// like 29.97 or a fraction like 60000/1001), then the server-probed proxy fps
+// from /api/data, then the 59.94 default when both are absent/unparseable.
+let FPS = 59.94;
+function parseFps(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (s.includes("/")) { const [n, d] = s.split("/").map(Number); return d ? n / d : null; }
+  const f = Number(s);
+  return (isFinite(f) && f > 0) ? f : null;
+}
+const FPS_QUERY = parseFps(new URLSearchParams(location.search).get("fps"));
 let plan = [];              // global [start,end] playback segments
 let selIn = null, selOut = null;
 let evSeq = 0;
@@ -136,6 +215,7 @@ const CATCOLOR = { retake: "var(--cut-retake)", false_start: "var(--cut-false_st
 const g2 = s => `${String(Math.floor(s/60)).padStart(2,"0")}:${(s%60).toFixed(1).padStart(4,"0")}`;
 const toGlobal = (clip, t) => OFFSETS[clip] + t;
 function fromGlobal(t) {
+  if (!MANIFEST || !MANIFEST.parts || !MANIFEST.parts.length) return { clip: "-", t };
   let p = MANIFEST.parts[0];
   for (const q of MANIFEST.parts) if (t >= q.offset) p = q;
   return { clip: p.id, t: t - p.offset };
@@ -143,7 +223,9 @@ function fromGlobal(t) {
 
 async function init() {
   const r = await fetch("/api/data"); const j = await r.json();
+  if (!r.ok) { setStatus(j.error + (j.hint ? " - " + j.hint : ""), "err"); return; }
   DATA = j.cuts; MANIFEST = j.manifest; TOTAL = MANIFEST.total;
+  FPS = FPS_QUERY || parseFps(j.fps) || 59.94;  // query wins, then server probe, then default
   for (const p of MANIFEST.parts) OFFSETS[p.id] = p.offset;
   events = [];
   for (const c of DATA.clips) {
@@ -389,6 +471,7 @@ async function render() {
 /* ---------- playback ---------- */
 function seek(t) { vid.currentTime = Math.max(0, Math.min(t, TOTAL - 0.05)); updatePlayhead(); }
 function updatePlayhead() {
+  if (!MANIFEST) return;
   const t = vid.currentTime;
   $("playhead").style.left = (t * pps) + "px";
   const loc = fromGlobal(t);
@@ -436,14 +519,15 @@ window.addEventListener("mouseup", () => {
   drag = null;
 });
 document.addEventListener("keydown", e => {
+  if (document.body.dataset.workspace === "scenes") return;
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
   const k = e.key;
   if (k === " ") { e.preventDefault(); vid.paused ? vid.play() : vid.pause(); }
   else if (k === "e" || k === "E") $("modeBtn").click();
   else if (k === "ArrowLeft") seek(vid.currentTime - (e.shiftKey ? 10 : 2));
   else if (k === "ArrowRight") seek(vid.currentTime + (e.shiftKey ? 10 : 2));
-  else if (k === ",") seek(vid.currentTime - 1/59.94);
-  else if (k === ".") seek(vid.currentTime + 1/59.94);
+  else if (k === ",") seek(vid.currentTime - 1/FPS);
+  else if (k === ".") seek(vid.currentTime + 1/FPS);
   else if (k === "i" || k === "I") { selIn = vid.currentTime; drawSelMarks(); setStatus(`in @ ${g2(selIn)}`); }
   else if (k === "o" || k === "O") { selOut = vid.currentTime; drawSelMarks(); setStatus(`out @ ${g2(selOut)}`); }
   else if (k === "c" || k === "C") cutSelection();
@@ -465,5 +549,6 @@ vid.addEventListener("loadedmetadata", () => { if (Math.abs(vid.duration - TOTAL
 
 init();
 </script>
+<script src="/scene-editor.js"></script>
 </body>
 </html>

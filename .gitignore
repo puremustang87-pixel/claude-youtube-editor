@@ -49,6 +49,9 @@ media/library/faces/*.webp
 # ARE committed — so there is intentionally NO blanket *.mp3 rule here.
 
 # editor / OS
+.playwright-cli/
+output/playwright/
+editor-server.*.log
 .vscode/
 .idea/
 .DS_Store

@@ -11,12 +11,20 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from encoders import EncodePlan, plan_h264
+
+# 720p H.264 editor proxy. Encoder + hwaccel come from encoders.py: nvenc where
+# present (the old h264_nvenc path, unchanged), else videotoolbox / libx264.
+# Force one with CYE_ENCODER=<name>.
+PROXY_PLAN: EncodePlan = plan_h264("proxy")
+
 
 def encode_part(src: Path, out: Path) -> None:
+    # hwaccel_in is empty on non-NVIDIA, so decode falls back to software cleanly.
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-hwaccel", "cuda", "-i", str(src),
+        ["ffmpeg", "-y", "-loglevel", "error", *PROXY_PLAN.hwaccel_in, "-i", str(src),
          "-map", "0:0", "-map", "0:1", "-vf", "scale=1280:-2,format=yuv420p",
-         "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "29", "-b:v", "0",
+         *PROXY_PLAN.video_args,
          "-c:a", "aac", "-b:a", "160k", str(out)],
         check=True,
     )
@@ -32,9 +40,19 @@ def duration_of(path: Path) -> float:
 
 def main() -> None:
     project = Path(__file__).resolve().parent.parent / sys.argv[1]
-    data = json.loads((project / "work" / "analysis" / "cuts.json").read_text(encoding="utf-8"))
+    cuts_path = project / "work" / "analysis" / "cuts.json"
+    if not cuts_path.exists():
+        raise SystemExit(
+            f"Project is not ready for a cut proxy: {cuts_path} does not exist.\n"
+            "You can use the Scenes workspace now with:  ./workbench video-1\n"
+            "Build a proxy only after importing footage and creating cuts.json."
+        )
+    data = json.loads(cuts_path.read_text(encoding="utf-8"))
     out_dir = project / "work" / "editor"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"proxy encoder: {PROXY_PLAN.encoder}"
+          + (" +hwaccel cuda" if PROXY_PLAN.hwaccel_in else ""))
 
     by_id = {c["id"]: c for c in data["clips"]}
     parts = [(cid, project / by_id[cid]["file"], out_dir / f"part-{cid}.mp4") for cid in data["clip_order"]]

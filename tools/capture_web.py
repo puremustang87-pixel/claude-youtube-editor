@@ -45,6 +45,24 @@ Every "shot" saves <out_dir>/<name>.png and appends a manifest entry
 {name, file, url_label, title} -> <out_dir>/manifest.json, ready to map onto
 ScreencastPage objects (img/url/tabTitle) in the shot TSX.
 
+While it drives the choreography it ALSO harvests, for every interaction step
+(click / fill / scroll), the target element's on-screen geometry: Playwright
+knows each element's exact bounding box, so we record its CENTER as VIEWPORT
+FRACTIONS (cx, cy in 0..1 — the same coordinate convention the screencast engine
+uses for cursor keys), the viewport size, and which captured shot the interaction
+sits between. This lands in the manifest as a new top-level shape:
+
+  {"pages": [<the old shot entries>], "interactions": [<per-step geometry>]}
+
+so tools/gen_screencast.py can compile the manifest straight into a tuned TSX
+shot (cursor path + clicks) with no by-hand fraction math. The manifest stays
+BACKWARD-COMPATIBLE: `pages` holds exactly the objects the tool always wrote, and
+any old consumer that json.load()s a list still works via the compatibility notes
+below (see write_manifest). Interaction harvesting is best-effort — if an element
+has no box (detached / off-screen) the entry is still recorded with null coords,
+and the whole feature is skipped cleanly when playwright isn't installed, exactly
+as capture itself is.
+
 Usage:
   venv/Scripts/python.exe tools/capture_web.py --spec <spec.json> [--headed] [--keep-server]
 """
@@ -60,6 +78,35 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def rp(p):
     return p if os.path.isabs(p) else os.path.join(ROOT, p)
+
+
+def _clamp01(v):
+    return 0.0 if v < 0 else (1.0 if v > 1 else v)
+
+
+def element_center_fraction(page, selector, vw, vh):
+    """Center of `selector`'s bounding box as VIEWPORT FRACTIONS (cx, cy in 0..1).
+
+    Returns (cx, cy) or (None, None) when the element is missing or has no box
+    (detached / display:none / zero-size). Best-effort: any Playwright hiccup
+    degrades to (None, None) rather than aborting the capture — the geometry is a
+    convenience for gen_screencast.py, never a reason to lose a screenshot.
+
+    The image the screencast engine paints fills the page region fit-to-width and
+    top-aligned, so a viewport-fraction center maps 1:1 onto a cursor keyframe.
+    """
+    try:
+        el = page.query_selector(selector)
+        if el is None:
+            return None, None
+        box = el.bounding_box()  # {x, y, width, height} in CSS px, or None
+    except Exception:
+        return None, None
+    if not box or not vw or not vh:
+        return None, None
+    cx = (box["x"] + box["width"] / 2.0) / float(vw)
+    cy = (box["y"] + box["height"] / 2.0) / float(vh)
+    return _clamp01(cx), _clamp01(cy)
 
 
 def wait_http(url, timeout_s=60):
@@ -121,6 +168,29 @@ def start_serve_web(cfg):
     return proc, wb
 
 
+def write_manifest(path, pages, interactions, viewport, out_dir):
+    """Write the manifest in the dual shape:
+
+        {"pages": [...old shot entries...], "interactions": [...], "viewport": [w,h], ...}
+
+    `pages` is byte-for-byte the list the tool has always produced (same keys:
+    name/file/url_label/title), just nested under a "pages" key so the new
+    "interactions" array can live beside it. gen_screencast.py reads either this
+    object OR a bare legacy list (a plain list is treated as pages-only), so old
+    manifests still compile. Anyone who used to `json.load()` the old list should
+    read `data["pages"]` when the loaded value is a dict — a one-line guard.
+    """
+    doc = {
+        "pages": pages,
+        "interactions": interactions,
+        "viewport": list(viewport),
+        "out_dir": out_dir,
+        "schema": "capture_web/2",  # v1 was a bare list of page entries
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=1)
+
+
 def main():
     args = sys.argv[1:]
     headed = "--headed" in args
@@ -146,7 +216,10 @@ def main():
     if spec.get("serve_web"):
         server, workbench = start_serve_web(spec["serve_web"])
 
-    manifest = []
+    manifest = []          # old shape: one entry per shot (unchanged)
+    interactions = []      # new: per-step geometry, tagged with the shots it sits between
+    last_shot = None       # name of the most recent shot captured so far
+    pending = []           # interactions recorded since last_shot, awaiting their after_shot
     from playwright.sync_api import sync_playwright
     try:
         with sync_playwright() as pw:
@@ -177,20 +250,40 @@ def main():
                 elif "wait_for" in step:
                     page.wait_for_selector(step["wait_for"], timeout=30000)
                 elif "click" in step:
+                    sel = step["click"]
+                    # harvest the target geometry BEFORE the click navigates away
+                    # (afterwards the element may be detached and box-less)
+                    cx, cy = element_center_fraction(page, sel, vw, vh)
                     if step.get("optional"):
                         try:
-                            page.click(step["click"], timeout=int(step.get("timeout", 4000)))
+                            page.click(sel, timeout=int(step.get("timeout", 4000)))
                         except Exception:
-                            print(f"  (optional click skipped: {step['click']})")
+                            print(f"  (optional click skipped: {sel})")
+                            cx = cy = None
                     else:
-                        page.click(step["click"])
+                        page.click(sel)
+                    pending.append({"index": i, "type": "click", "selector": sel,
+                                    "cx": cx, "cy": cy, "viewport": [vw, vh],
+                                    "before_shot": last_shot, "after_shot": None})
                 elif "fill" in step:
                     sel, val = step["fill"]
+                    cx, cy = element_center_fraction(page, sel, vw, vh)
                     page.fill(sel, val)
+                    pending.append({"index": i, "type": "fill", "selector": sel,
+                                    "value": val, "cx": cx, "cy": cy, "viewport": [vw, vh],
+                                    "before_shot": last_shot, "after_shot": None})
                 elif "press" in step:
                     page.keyboard.press(step["press"])
                 elif "scroll" in step:
-                    page.evaluate(f"window.scrollTo(0, {int(step['scroll'])})")
+                    y = int(step["scroll"])
+                    page.evaluate(f"window.scrollTo(0, {y})")
+                    # no target element for a scroll; record the scroll px (the
+                    # engine's page.scroll is image-px translateY) as a hint, but no
+                    # cursor target (cx/cy null so it is never treated as a click)
+                    pending.append({"index": i, "type": "scroll", "selector": None,
+                                    "scroll_px": y, "cx": None, "cy": None,
+                                    "viewport": [vw, vh],
+                                    "before_shot": last_shot, "after_shot": None})
                 elif "eval" in step:
                     page.evaluate(step["eval"])
                 elif "shot" in step:
@@ -200,6 +293,14 @@ def main():
                     manifest.append({"name": name, "file": os.path.basename(fn),
                                      "url_label": step.get("url_label", ""),
                                      "title": step.get("title", "")})
+                    # every interaction since the previous shot RESULTED IN this
+                    # page: tag it so gen_screencast.py can fire the click just
+                    # before this page's enterAt
+                    for it in pending:
+                        it["after_shot"] = name
+                    interactions.extend(pending)
+                    pending = []
+                    last_shot = name
                     print(f"  shot [{len(manifest):02d}] {name}.png")
                 else:
                     raise SystemExit(f"unknown step {i}: {step}")
@@ -209,14 +310,17 @@ def main():
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(server.pid)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    # interactions after the final shot never got an after_shot; keep them anyway
+    interactions.extend(pending)
+
     mf = os.path.join(out_dir, "manifest.json")
-    with open(mf, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=1)
+    write_manifest(mf, manifest, interactions, [vw, vh], spec.get("out_dir", ""))
     try:
         shown = os.path.relpath(out_dir, ROOT)
     except ValueError:  # out_dir on a different drive than the repo
         shown = out_dir
-    print(f"done: {len(manifest)} shot(s) -> {shown}  (+ manifest.json)")
+    print(f"done: {len(manifest)} shot(s), {len(interactions)} interaction(s) "
+          f"-> {shown}  (+ manifest.json)")
 
 
 if __name__ == "__main__":

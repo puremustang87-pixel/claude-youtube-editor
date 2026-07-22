@@ -66,6 +66,38 @@ cd remotion && npm run studio
 That's the fastest way to see what this produces, and reading a few is the fastest way to learn
 `remotion/src/lib/` (the browser frame, the screencast engine, the VS Code shell, the motion kit).
 
+## Use the video workbench
+
+The local workbench now puts the human cut and visual scene plan in one browser UI:
+
+```bash
+./workbench video-1
+```
+
+That is the whole startup flow: one terminal and one browser tab. The launcher works from WSL,
+opens the Scenes workspace automatically, and stays in the foreground until you press `Ctrl+C`.
+It uses the Windows runtime from WSL when the repository has Windows-native Remotion dependencies.
+
+For a checkout stored on the Windows drive and opened from WSL:
+
+```bash
+cd /mnt/c/path/to/claude-youtube-editor
+./workbench video-1
+```
+
+You do not need a proxy to plan or preview scenes. Build one only after the project has real footage
+and `cuts.json`: `python.exe tools/make_proxy.py videos/video-1`.
+
+Use **Cut** for transcript decisions and **Scenes** to search the Remotion catalog, add a composition
+at the playhead, drag or retime cutaway/overlay blocks, write cue and revision notes, render a frame,
+render the selected composition, and bake the full preview. Scene saves now use the accepted v2.1
+scene/take contract: stable placement IDs, immutable takes, atomic backups, stale-save ETags, and durable
+job records. Legacy `id`/`asset` fields are derived so `tools/bake.py` remains compatible.
+
+Fable, Hyperframe, Remotion, and imported media all converge on the same scene/take model instead of
+maintaining separate timelines. See [`tools/editor/README.md`](tools/editor/README.md) and the accepted
+contracts under [`docs/contracts/v2.1/`](docs/contracts/v2.1/) for the exact rules.
+
 ## Make it yours
 
 The repo ships with a house brand — a calm, premium indigo look. It's real and you can keep it, but
@@ -100,6 +132,9 @@ Open source, and I'm keeping it updated:
 - [ ] **Transitions** — a proper transition library between beats
 - [ ] **Effects** — zoom/punch-in, highlight, spotlight passes
 - [ ] **Filters** — grade/look presets that respect the brand contract
+- [x] **Integrated scene timeline** — select, retime, preview, render, and bake Remotion/asset scenes
+- [ ] **Schema-driven scene controls** — edit typed Remotion props without touching TSX
+- [ ] **Direct Hyperframe adapter** — submit/generate/poll inside the workbench instead of asset handoff
 - [ ] A cuts.json time-remapper (so `edited-transcript.json` doesn't need a second transcription pass)
 
 ⭐ **Star the repo** if you want to see where it goes — that's genuinely how I decide what to build next.

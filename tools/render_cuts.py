@@ -4,7 +4,11 @@ Usage:
   python tools/render_cuts.py video-1 --style tight --mode preview
   python tools/render_cuts.py video-1 --style tight --mode final
 
-preview: 720p h264_nvenc, fast.  final: 4K60 10-bit hevc_nvenc, high quality.
+preview: 720p H.264, fast.  final: 10-bit HEVC (source-fps), high quality.
+
+Encoder + hwaccel are chosen per-machine by tools/encoders.py (nvenc where present,
+else videotoolbox on Macs, else libx264/libx265). On an NVIDIA box this is the old
+h264_nvenc / hevc_nvenc path unchanged. Force one with CYE_ENCODER=<name>.
 
 Segments come from cutlib.plan_clip: keeps are split into speech runs at pauses
 >= internal_gap, each run's tail is snapped to the audio floor (words finish
@@ -28,24 +32,25 @@ from fractions import Fraction
 from pathlib import Path
 
 from cutlib import AudioProbe, active_keeps, load_words, plan_clip
+from encoders import EncodePlan, plan_h264, plan_hevc, probe_fps
 
 SR = 48000  # audio build sample rate
 
-ENC = {
-    "preview": ["-vf", "scale=1280:-2,format=yuv420p", "-c:v", "h264_nvenc", "-preset", "p4",
-                "-rc", "vbr", "-cq", "30", "-b:v", "0"],
-    "final": ["-c:v", "hevc_nvenc", "-preset", "p5", "-profile:v", "main10",
-              "-pix_fmt", "p010le", "-rc", "vbr", "-cq", "19", "-b:v", "0"],
-}
+# preview is scaled to 720p; final keeps source resolution. The encoder + its
+# quality knobs (nvenc -cq / x26x -crf / videotoolbox -q:v) come from encoders.py.
+PREVIEW_VF = ["-vf", "scale=1280:-2,format=yuv420p"]
 AUDIO_BITRATE = {"preview": "160k", "final": "256k"}
 
 
-def render_segment(src: Path, seg: tuple[float, float], out: Path, enc: list[str]) -> None:
+def render_segment(src: Path, seg: tuple[float, float], out: Path, plan: EncodePlan,
+                   pre_vf: list[str]) -> None:
     start, end = seg
     dur = end - start
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-hwaccel", "cuda",
+    # hwaccel_in is ["-hwaccel","cuda"] only when an nvenc encoder was selected;
+    # empty otherwise (Mac/AMD/Intel), so decode falls back to software cleanly.
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", *plan.hwaccel_in,
            "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
-           "-map", "0:0", "-an", *enc, str(out)]
+           "-map", "0:0", "-an", *pre_vf, *plan.video_args, str(out)]
     subprocess.run(cmd, check=True)
 
 
@@ -85,6 +90,18 @@ def main() -> None:
     style = data["styles"][args.style]
     probe = AudioProbe(project)
 
+    # pick the encoder for this machine ONCE. preview/proxy = H.264; final = 10-bit
+    # HEVC (falls back down encoders.py's ladders on non-NVIDIA / older ffmpeg).
+    if args.mode == "final":
+        enc_plan = plan_hevc("final", want_10bit=True)
+        pre_vf: list[str] = []
+    else:
+        enc_plan = plan_h264("preview")
+        pre_vf = PREVIEW_VF
+    print(f"encoder: {enc_plan.encoder}"
+          + (" (10-bit)" if enc_plan.ten_bit else "")
+          + (" +hwaccel cuda" if enc_plan.hwaccel_in else ""))
+
     jobs = []  # (source file, (start, end))
     by_id = {c["id"]: c for c in data["clips"]}
     for cid in data["clip_order"]:
@@ -101,7 +118,7 @@ def main() -> None:
     outs = [seg_dir / f"seg_{i:03d}.mp4" for i in range(len(jobs))]
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futs = [pool.submit(render_segment, src, seg, out, ENC[args.mode])
+        futs = [pool.submit(render_segment, src, seg, out, enc_plan, pre_vf)
                 for (src, seg), out in zip(jobs, outs)]
         for i, f in enumerate(futs):
             f.result()
@@ -114,7 +131,9 @@ def main() -> None:
     # into the video (~10-16ms per cut => ~0.8s over ~100 cuts on 59.94fps footage),
     # while the sample-exact audio has none -> progressive lip-sync drift. TS carries no
     # per-file trailing gap, so the concat stays frame-exact (bounded, non-accumulating).
-    bsf = "hevc_mp4toannexb" if args.mode == "final" else "h264_mp4toannexb"
+    # bsf follows the chosen codec (hevc_* for HEVC finals, h264_* otherwise) — see
+    # encoders.py, which also decides between h264/hevc AnnexB.
+    bsf = enc_plan.bitstream_filter()
     ts_files = []
     for o in outs:
         ts = o.with_suffix(".ts")
@@ -144,18 +163,28 @@ def main() -> None:
 
     # NB (2026-07-11): the HEVC final still stamps its frame PTS ~0.1% fast on 59.94fps
     # footage (r_frame_rate stays 60000/1001 but the PTS span runs ~0.3s short over ~4min),
-    # an hevc_nvenc/TS quirk that a stream COPY can't correct. It's separate from (and far
-    # smaller than) the ~0.8s concat accumulation fixed above. The h264 preview stamps
-    # correctly. Correct the final at delivery by re-timing on re-encode: prepend
-    # `-r 60000/1001` (the source fps) BEFORE `-i` when transcoding — that re-stamps every
-    # frame to true CFR with no frame loss. Verify any delivered file with:
-    # ffprobe stream=duration on v:0 vs a:0 — they must be equal.
+    # an hevc_nvenc/TS quirk that a stream COPY alone can't correct. It's separate from (and
+    # far smaller than) the ~0.8s concat accumulation fixed above. The h264 preview stamps
+    # correctly, so we only re-stamp the final. Fix = re-time by prepending `-r <source fps>`
+    # BEFORE `-i` on the video input: ffmpeg then reinterprets every copied frame onto a true
+    # CFR grid at the source rate (no re-encode, no frame loss). The rate is the ACTUAL source
+    # fps via probe_fps() — NOT a hardcoded 60000/1001 — so 24/25/30/59.94 footage all
+    # self-correct. Verify: ffprobe stream=duration on v:0 vs a:0 must be equal.
+    restamp: list[str] = []
+    if args.mode == "final":
+        try:
+            src_fps = probe_fps(jobs[0][0])  # footage is uniform; first clip's rate
+            restamp = ["-r", src_fps]
+            print(f"re-stamping final to CFR {src_fps} (source fps)")
+        except Exception as e:  # noqa: BLE001 — never let a probe failure kill the render
+            print(f"warning: could not probe source fps for re-stamp ({e}); "
+                  f"delivering without re-stamp")
 
-    # single mux: copied video + one continuous AAC encode
+    # single mux: video (copied, final re-stamped to source-fps CFR) + one continuous AAC encode
     out_name = f"{'preview' if args.mode == 'preview' else 'master'}-{args.style}.mp4"
     out_path = project / "output" / out_name
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
-                    "-i", str(video_concat), "-i", str(audio_concat),
+                    *restamp, "-i", str(video_concat), "-i", str(audio_concat),
                     "-map", "0:v", "-map", "1:a", "-c:v", "copy",
                     "-c:a", "aac", "-b:a", AUDIO_BITRATE[args.mode],
                     str(out_path)], check=True)

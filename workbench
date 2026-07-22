@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if grep -qi microsoft /proc/version 2>/dev/null && command -v python.exe >/dev/null 2>&1; then
+  # The repo and npm dependencies live on Windows. Launch the Windows Python
+  # runtime from WSL so Remotion uses its installed win32 native compositor.
+  WINDOWS_LAUNCHER="$(wslpath -w "$ROOT_DIR/tools/workbench.py")"
+  if [ "$#" -eq 0 ]; then
+    set -- video-1
+  fi
+  exec python.exe "$WINDOWS_LAUNCHER" "$@"
+fi
+
+PYTHON_BIN=python3
+if ! "$PYTHON_BIN" -c "import sys; assert sys.version_info >= (3, 9)" >/dev/null 2>&1; then
+  PYTHON_BIN=python
+fi
+
+if [ "$#" -eq 0 ]; then
+  set -- video-1
+fi
+
+exec "$PYTHON_BIN" "$ROOT_DIR/tools/workbench.py" "$@"
