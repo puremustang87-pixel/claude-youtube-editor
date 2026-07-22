@@ -15,15 +15,20 @@ Frame-accurate: per-segment frame counts come from rounded cumulative boundaries
 the total matches the audio exactly (no cumulative drift).
 
 Usage:
-  python tools/bake.py [video-1/work/timeline.json] [--end SECONDS] [--keep]
+  python tools/bake.py [videos/video-1/work/timeline.json] [--end SECONDS] [--keep]
+  python tools/bake.py [videos/video-1/work/timeline.json] --check
 """
 import json
 import os
 import subprocess
 import sys
 import shutil
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EDITOR_DIR = os.path.join(ROOT, "tools", "editor")
+sys.path.insert(0, EDITOR_DIR)
+from contracts import migrate_timeline, validate_timeline  # noqa: E402
 
 
 def proj(p):
@@ -45,6 +50,8 @@ def main():
     args = sys.argv[1:]
     keep = "--keep" in args
     args = [a for a in args if a != "--keep"]
+    check_only = "--check" in args
+    args = [a for a in args if a != "--check"]
     end_override = None
     if "--end" in args:
         i = args.index("--end")
@@ -55,6 +62,23 @@ def main():
     with open(tl_path, "r", encoding="utf-8") as f:
         tl = json.load(f)
 
+    project = Path(tl_path).resolve().parent.parent
+    manifest_path = Path(ROOT) / "remotion" / "src" / "shots.manifest.json"
+    try:
+        catalog_items = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        catalog_items = []
+    catalog = {str(item.get("id")): item for item in catalog_items if isinstance(item, dict) and item.get("id")}
+    tl = migrate_timeline(tl, set(catalog), Path(ROOT), project)
+    issues = validate_timeline(tl, catalog, Path(ROOT), project)
+    if check_only:
+        print(json.dumps({"issues": issues}, indent=2, ensure_ascii=False))
+        raise SystemExit(1 if any(item.get("severity") == "E" for item in issues) else 0)
+    blocking = [item for item in issues if item.get("severity") == "E"]
+    if blocking:
+        summary = "\n".join(f"  {item['code']}: {item['message']}" for item in blocking)
+        raise SystemExit(f"bake blocked by validation:\n{summary}\nrun with --check for structured details")
+
     master = proj(tl["master"])                                     # project data -> CWD
     out_dir = os.path.join(ROOT, tl.get("remotion_out", "remotion/out"))  # engine -> ROOT
     pv = tl["preview"]
@@ -63,17 +87,24 @@ def main():
     out_path = proj(pv["out"])                                      # project data -> CWD
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    # resolve each shot to its rendered file (cutaway->.mp4, overlay->.mov)
+    # Resolve each shot to its rendered file. Remotion shots use the historical
+    # remotion/out/<id> convention. Other engines (Hyperframe exports, stock
+    # media, real captures) may provide an explicit `asset` path. Disabled
+    # scenes stay in the editable plan but are intentionally absent from a bake.
     shots = []
     for s in tl["shots"]:
+        if not s.get("enabled", True):
+            continue
         a = max(0.0, float(s["master_in_s"]))
         b = min(END, float(s["master_out_s"]))
         if b <= a:
             continue  # entirely past the preview window
         ext = ".mov" if s["type"] == "overlay" else ".mp4"
-        f = os.path.join(out_dir, s["id"] + ext)
+        f = proj(s["asset"]) if s.get("asset") else os.path.join(out_dir, s["id"] + ext)
         if not os.path.exists(f):
-            raise SystemExit(f"missing rendered shot: {f} (render it first: npm run render / render-all {s['id']})")
+            hint = (f"export the {s.get('engine', 'external')} scene to its asset path"
+                    if s.get("asset") else f"render it first: npm run render / render-all {s['id']}")
+            raise SystemExit(f"missing rendered shot: {f} ({hint})")
         shots.append({"id": s["id"], "type": s["type"], "in": a, "out": b, "file": f})
 
     cutaways = [s for s in shots if s["type"] == "cutaway"]

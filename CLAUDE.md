@@ -9,11 +9,12 @@ your cut. No screen recording, no video editor. The right skill is picked from t
 | set up / change their brand, colors, fonts, wordmark | `/brand-setup` | `brand.md` + `remotion/src/{brand.ts,fonts.ts}` + a proof render |
 | cut the raw footage / tighten pacing / remove fillers | `/clean-cut` | master cut + `videos/<project>/work/{analysis/cuts.json, edited-transcript.json}` |
 | build the visual beats / add overlays | `/make-tsx` (+ `/fake-screencast`) | shots in `remotion/src/shots/<project>/` + a baked preview |
+| wrap a REAL screen recording in the branded system (proof: latency, live results) | `/real-screencast` | a proof shot in `remotion/src/shots/<project>/` using `lib/realscreencast.tsx` |
 | write a crash-free TSX shot | `/vidtsx-2d-generator` | the low-level Remotion authoring rules |
 | remove background noise / isolate voice | `/clean-audio` | a cleaned master (levels preserved) |
 | add SFX / sound-design a beat | `/suggest-sfx` | `videos/<project>/work/sfx-plan.json` + an audition mix |
 | package a video / titles + thumbnails | `/packaging` | `videos/<project>/packaging/` (1 title × 3 thumbnail bets + rendered thumbs) |
-| upload it | `tools/yt_upload.py` | a private draft on YouTube |
+| upload it | `tools/yt_upload.py` | a private draft on YouTube (built-in v:0==a:0 preflight; `--strict` to abort on drift) |
 
 The pipeline order is: **cut → visuals → voice → SFX → packaging → upload.**
 
@@ -25,8 +26,10 @@ three together; they drift silently if you hand-edit one.**
 
 ```
 tools/            Python tools (see requirements.txt); the cut-editor UI in tools/editor/;
-                  RNNoise models in tools/models/rnnoise/
-remotion/         the Remotion project — src/lib/ (kit, browser, screencast, vscode),
+                  RNNoise models in tools/models/rnnoise/; encoders.py (machine-adaptive
+                  encoder + fps probing), gen_screencast.py (capture manifest → shot TSX),
+                  verify_frames.py (visual QA gate)
+remotion/         the Remotion project — src/lib/ (kit, browser, screencast, realscreencast, vscode),
                   src/shots/<project>/; registry is GENERATED (npm run gen)
 media/            Remotion's public root: library/ (reusable: sfx, music, logos, faces)
                   + projects/<project>/ (media for ONE video — via staticFile('projects/<p>/x'))
@@ -60,6 +63,8 @@ current brand (wordmark, palette, type) so you can see it. `/brand-setup` uses i
   resolves to a system interpreter will hit `ModuleNotFoundError` (requests, Pillow, google-*) — that
   error means you're not on the venv. `ffmpeg`/`ffprobe` and `node`/`npx` must be on PATH (not pip).
 
+- **Rendering is machine-adaptive.** `tools/render_cuts.py` and `tools/make_proxy.py` pick the encoder via `tools/encoders.py`: NVIDIA `h264_nvenc`/`hevc_nvenc` where present (unchanged), else Apple `videotoolbox`, else `libx264`/`libx265`. `-hwaccel cuda` is emitted only for NVENC. The 10-bit HEVC master falls back to 8-bit only if no HEVC encoder exists (with a loud warning). Force a specific encoder with `CYE_ENCODER=<name>` (e.g. `CYE_ENCODER=libx264`). Frame rate is never assumed — the final's CFR re-stamp uses the footage's probed fps, and the cut editor's `,`/`.` frame-step is fps-aware (server-probed, `?fps=` override, 59.94 default).
+
 - **API keys** live in `.env` at the repo root (copy `.env.example`). Never commit `.env`.
   `ASSEMBLYAI_API_KEY` = transcription · `ELEVENLABS_API_KEY` = voice-isolate + SFX + music ·
   `GEMINI_API_KEY` = thumbnails. **YouTube uses OAuth, not a key**: `tools/yt_upload.py` (upload) and
@@ -85,6 +90,10 @@ current brand (wordmark, palette, type) so you can see it. `/brand-setup` uses i
 - **QA is not optional:** render frames and READ them before declaring a shot done; run
   `verify_cut.py` on every cut render (it catches ghost speech + A/V drift); audit the SFX cue sheet
   before mixing. Scratch renders/frames go in a scratch dir, not the project.
+  `tools/verify_frames.py` machine-triages the frame-read: declare `QA_CUES` in a shot, and it
+  renders those frames and runs structural checks + golden-frame regression (+ optional `--ai`
+  assertions via Gemini). It points your eye at problems — it does not replace it. `--approve` sets
+  the golden baseline once a shot looks right.
 
 - **The brand contract is three files.** `brand.md`, `remotion/src/brand.ts`, `remotion/src/fonts.ts`.
   Nothing errors when they disagree — the docs just stop describing the videos. Change them together,

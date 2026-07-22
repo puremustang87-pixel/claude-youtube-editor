@@ -20,8 +20,13 @@ Setup (one-time, needs your browser — see tools/yt_upload_SETUP.md):
 Usage:
   python tools/yt_upload.py auth
   python tools/yt_upload.py upload shorts/ch-3-honeypot/publish.json
-  python tools/yt_upload.py upload <plan> --dry-run     # validate plan + preview, no API call
+  python tools/yt_upload.py upload <plan> --dry-run     # validate plan + preview + A/V gate, no API call
+  python tools/yt_upload.py upload <plan> --strict      # abort if v:0/a:0 durations drift >50ms
   python tools/yt_upload.py whoami                        # confirm which channel is authorized
+
+Last-gate A/V check: before upload the tool ffprobes the file and compares v:0 vs a:0 stream
+durations (clean-cut's step-10 gate). It warns LOUDLY on a >50ms mismatch and aborts under
+--strict; default is warn-and-continue, so existing behavior is unchanged.
 
 Requires (real upload only; --dry-run needs none of these):
   pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
@@ -32,6 +37,7 @@ the YouTube API Services Audit & Quota Extension form (or use an older project t
 """
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -51,6 +57,12 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
 TITLE_MAX, DESC_MAX, TAGS_CHARS_MAX = 100, 5000, 460
 # common categories: 27 Education · 28 Science & Technology · 22 People & Blogs
 DEFAULT_CATEGORY = 28
+
+# Last-gate A/V sync preflight. clean-cut's step-10 rule: gate on v:0 duration == a:0
+# duration. verify_cut's A/V budget GROWS along the timeline (±2s by mid-video) and masks
+# a real accumulating drift, so the equal-duration check is the definitive one — yet this
+# tool is the LAST gate before YouTube and never checked it. 50ms ≈ noticeable lip-sync slip.
+AV_SYNC_TOLERANCE_S = 0.050
 
 
 def rp(p: str) -> Path:
@@ -127,6 +139,65 @@ def preview(plan: dict, body: dict) -> None:
     print("───────────────────────────────────────────────")
 
 
+def _stream_duration(path: Path, stream: str):
+    """Duration (seconds, float) of ffprobe stream selector `stream` (e.g. 'v:0','a:0'),
+    or None if ffprobe is missing, the stream is absent, or the duration is unreadable.
+    Mirrors clean-cut step 10's `ffprobe -show_entries stream=duration` gate."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", stream,
+             "-show_entries", "stream=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if out.returncode != 0:
+        return None
+    txt = (out.stdout or "").strip().splitlines()
+    if not txt or not txt[0].strip() or txt[0].strip().upper() == "N/A":
+        return None
+    try:
+        return float(txt[0].strip())
+    except ValueError:
+        return None
+
+
+def preflight_av_sync(video: Path, strict: bool) -> None:
+    """LAST gate before YouTube: ffprobe the file and compare v:0 vs a:0 stream durations.
+    Warn LOUDLY when they differ by more than AV_SYNC_TOLERANCE_S; abort (exit) when --strict.
+    Advisory by default so existing behavior is unchanged — a warn-and-continue.
+
+    This is the exact gate clean-cut prescribes for the master (step 10): verify_cut's A/V
+    budget grows along the timeline and hides accumulating drift, so equal v:0/a:0 duration is
+    the definitive check. The uploader is the last place to catch a drifted deliverable."""
+    vd = _stream_duration(video, "v:0")
+    ad = _stream_duration(video, "a:0")
+    if vd is None or ad is None:
+        # ffprobe absent, or a stream missing (audio-less clip / image) — note, don't block.
+        missing = []
+        if vd is None:
+            missing.append("v:0")
+        if ad is None:
+            missing.append("a:0")
+        print("• A/V sync preflight: skipped (couldn't read %s duration — ffprobe missing or "
+              "stream absent)." % ", ".join(missing))
+        return
+
+    delta = abs(vd - ad)
+    if delta > AV_SYNC_TOLERANCE_S:
+        print("!" * 63)
+        print("! A/V DURATION MISMATCH — v:0 %.3fs vs a:0 %.3fs (Δ %.3fs > %.0fms tolerance)"
+              % (vd, ad, delta, AV_SYNC_TOLERANCE_S * 1000))
+        print("! Audio and video are drifting apart. clean-cut's rule: v:0 duration MUST equal")
+        print("! a:0 duration. Fix upstream (the re-timing H.264 transcode in clean-cut step 10")
+        print("! makes v:0==a:0) before publishing — do NOT ship a lip-sync-drifted master.")
+        print("!" * 63)
+        if strict:
+            sys.exit("aborting (--strict): A/V duration mismatch exceeds tolerance.")
+        print("  (continuing — pass --strict to make this abort the upload.)")
+    else:
+        print("• A/V sync preflight: OK (v:0 %.3fs ≈ a:0 %.3fs, Δ %.3fs)." % (vd, ad, delta))
+
+
 def get_creds():
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -151,9 +222,13 @@ def service():
     return build("youtube", "v3", credentials=get_creds())
 
 
-def do_upload(plan: dict) -> None:
+def do_upload(plan: dict, strict: bool = False) -> None:
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
+
+    # last gate before YouTube — v:0 vs a:0 duration (clean-cut step 10). Runs after the
+    # plan validated + previewed, right before bytes go up. Advisory unless --strict.
+    preflight_av_sync(rp(plan["video"]), strict)
 
     yt = service()
     body = build_body(plan)
@@ -200,6 +275,8 @@ def main() -> None:
     up = sub.add_parser("upload", help="upload a video from a publish.json plan")
     up.add_argument("plan")
     up.add_argument("--dry-run", action="store_true", help="validate + preview, no API call")
+    up.add_argument("--strict", action="store_true",
+                    help="abort if v:0/a:0 durations differ by >50ms (default: warn + continue)")
     args = ap.parse_args()
 
     if args.cmd == "auth":
@@ -225,9 +302,11 @@ def main() -> None:
         sys.exit(1)
     preview(plan, body)
     if args.dry_run:
+        # run the A/V gate in dry-run too, so it can be validated / CI-gated without an upload
+        preflight_av_sync(rp(plan["video"]), args.strict)
         print("dry-run OK — plan is valid. Remove --dry-run to upload.")
         return
-    do_upload(plan)
+    do_upload(plan, args.strict)
 
 
 if __name__ == "__main__":
