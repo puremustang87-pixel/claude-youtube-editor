@@ -269,6 +269,20 @@
 }
 .scene-take-import:hover { color: #cbd7eb; border-color: var(--accent); }
 .scene-take-import.busy { opacity: .55; cursor: wait; }
+.scene-generate-dialog {
+  width: min(520px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid #4a5260;
+  border-radius: 10px;
+  background: #20242c;
+  color: #dbe0e9;
+}
+.scene-generate-dialog::backdrop { background: rgba(7, 9, 13, .72); }
+.scene-generate-dialog form { display: grid; gap: 13px; padding: 16px; }
+.scene-generate-dialog label { display: grid; gap: 6px; color: #aeb7c6; font-size: 10px; }
+.scene-generate-dialog textarea { min-height: 118px; resize: vertical; }
+.scene-generate-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.scene-generate-head strong { margin-right: 8px; font-size: 13px; }
 .scene-job-log {
   flex: 0 0 66px;
   max-height: 100px;

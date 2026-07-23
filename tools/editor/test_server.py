@@ -671,6 +671,159 @@ class TimelineTests(unittest.TestCase):
                 for patcher in reversed(patches):
                     patcher.stop()
 
+    def test_courier_generate_lifecycle_dedupes_promotes_cancels_and_accepts_late_candidate(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-courier-") as folder:
+            root = Path(folder)
+            project = root / "videos" / "project-courier"
+            timeline_path = project / "work" / "timeline.json"
+            jobs_dir = project / "work" / "jobs"
+            inbox_dir = project / "work" / "inbox"
+            timeline_path.parent.mkdir(parents=True)
+            scene_uid = "scn_COURIER1"
+            timeline_path.write_text(json.dumps(payload({
+                "scene_uid": scene_uid,
+                "id": scene_uid,
+                "engine": "fable",
+                "type": "cutaway",
+                "master_in_s": 4,
+                "master_out_s": 7,
+                "cue": "A calm product reveal",
+                "enabled": False,
+                "status": "planned",
+                "takes": [],
+                "active_take_uid": None,
+            })), encoding="utf-8")
+            patches = (
+                mock.patch.object(SERVER, "ROOT", root),
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "TIMELINE", timeline_path),
+                mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+                mock.patch.object(SERVER, "INBOX_DIR", inbox_dir),
+                mock.patch.object(SERVER, "EDITOR_MANIFEST", project / "work" / "editor" / "manifest.json"),
+                mock.patch.object(SERVER, "PROXY", project / "work" / "editor" / "proxy.mp4"),
+                mock.patch.object(SERVER, "COURIER_SETTLE_SECONDS", 0),
+            )
+            for patcher in patches:
+                patcher.start()
+
+            def fake_conform(source, staging, _scene, _timeline):
+                artifact = staging / "asset.mp4"
+                artifact.write_bytes(b"conformed:" + source.read_bytes())
+                return artifact, "cutaway_h264", {
+                    "w": 1920, "h": 1080, "fps": "30/1", "dur_s": 3.0,
+                    "alpha": False, "conformed": True,
+                }
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), SERVER.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                api_headers = {"X-Workbench-Token": SERVER.SESSION_TOKEN}
+                with urllib.request.urlopen(urllib.request.Request(base + "/api/scenes", headers=api_headers), timeout=5) as response:
+                    loaded = json.load(response)
+
+                def submit(etag, prompt):
+                    request = urllib.request.Request(
+                        base + f"/api/scene/{scene_uid}/revise",
+                        data=json.dumps({
+                            "prompt": prompt,
+                            "provider_hint": "fable",
+                            "duration_s": 3,
+                        }).encode(),
+                        method="POST",
+                        headers={
+                            **api_headers,
+                            "Content-Type": "application/json",
+                            "If-Match": etag,
+                        },
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 202)
+                        return json.load(response)
+
+                submitted = submit(loaded["etag"], "slow dolly across the product")
+                job_id = submitted["job_id"]
+                inbox = inbox_dir / job_id
+                self.assertTrue(inbox.is_dir())
+                self.assertEqual(submitted["job"]["state"], "submitted")
+                self.assertEqual(submitted["job"]["spec"], {
+                    "prompt": "slow dolly across the product",
+                    "provider_hint": "fable",
+                    "duration_s": 3.0,
+                })
+                self.assertEqual(submitted["scene"]["status"], "generating")
+
+                (inbox / "first.mp4").write_bytes(b"first")
+                with mock.patch.object(SERVER, "conform_take", side_effect=fake_conform):
+                    SERVER.poll_courier_jobs()
+                first_job = SERVER.read_job(job_id)
+                self.assertEqual(first_job["state"], "awaiting_pick")
+                self.assertEqual(len(first_job["candidates"]), 1)
+                first_take_uid = first_job["candidates"][0]["take_uid"]
+                first_timeline = SERVER.load_timeline()
+                first_take = first_timeline["shots"][0]["takes"][0]
+                self.assertEqual(first_take["provenance"]["job_id"], job_id)
+                self.assertEqual(first_take["provenance"]["spec"], submitted["job"]["spec"])
+
+                (inbox / "duplicate.mp4").write_bytes(b"first")
+                with mock.patch.object(SERVER, "conform_take", side_effect=fake_conform):
+                    SERVER.poll_courier_jobs()
+                deduped_job = SERVER.read_job(job_id)
+                self.assertEqual(len(deduped_job["candidates"]), 1)
+                self.assertEqual(len(SERVER.load_timeline()["shots"][0]["takes"]), 1)
+
+                promote = urllib.request.Request(
+                    base + f"/api/scene/{scene_uid}/takes/{first_take_uid}/promote",
+                    data=b"{}",
+                    method="POST",
+                    headers={
+                        **api_headers,
+                        "Content-Type": "application/json",
+                        "If-Match": SERVER.timeline_etag(),
+                    },
+                )
+                with urllib.request.urlopen(promote, timeout=5) as response:
+                    promoted = json.load(response)
+                self.assertEqual(promoted["scene"]["active_take_uid"], first_take_uid)
+                self.assertEqual(promoted["scene"]["status"], "draft")
+                self.assertEqual(SERVER.read_job(job_id)["state"], "succeeded")
+
+                (inbox / "late.mp4").write_bytes(b"second")
+                with mock.patch.object(SERVER, "conform_take", side_effect=fake_conform):
+                    SERVER.poll_courier_jobs()
+                late_job = SERVER.read_job(job_id)
+                self.assertEqual(late_job["state"], "awaiting_pick")
+                self.assertEqual(len(late_job["candidates"]), 2)
+                self.assertEqual(len(SERVER.load_timeline()["shots"][0]["takes"]), 2)
+
+                second = submit(SERVER.timeline_etag(), "alternate angle")
+                cancel = urllib.request.Request(
+                    base + f"/api/jobs/{second['job_id']}/cancel",
+                    data=b"{}",
+                    method="POST",
+                    headers={
+                        **api_headers,
+                        "Content-Type": "application/json",
+                        "If-Match": second["job"]["updated_at"],
+                    },
+                )
+                with urllib.request.urlopen(cancel, timeout=5) as response:
+                    canceled = json.load(response)
+                self.assertEqual(canceled["job"]["state"], "canceled")
+                canceled_inbox = inbox_dir / second["job_id"]
+                (canceled_inbox / "too-late.mp4").write_bytes(b"ignored")
+                with mock.patch.object(SERVER, "conform_take", side_effect=fake_conform):
+                    SERVER.poll_courier_jobs()
+                self.assertEqual(len(SERVER.load_timeline()["shots"][0]["takes"]), 2)
+                self.assertEqual(SERVER.read_job(second["job_id"])["state"], "canceled")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                for patcher in reversed(patches):
+                    patcher.stop()
+
     def test_concurrent_take_imports_with_one_etag_commit_exactly_one(self):
         with tempfile.TemporaryDirectory(prefix="video-workbench-import-race-") as folder:
             root = Path(folder)
