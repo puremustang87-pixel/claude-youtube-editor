@@ -19,6 +19,8 @@
     compare: null,
     takesOpen: true,
     importing: false,
+    currentJob: null,
+    jobPollTimer: null,
   };
 
   const sceneVid = $("sceneVid");
@@ -53,7 +55,7 @@
     if (name === "scenes") {
       if (Number.isFinite(vid.currentTime)) sceneVid.currentTime = vid.currentTime;
       renderSceneTimeline();
-    } else if (Number.isFinite(sceneVid.currentTime)) {
+    } else if (Number.isFinite(playbackMasterTime())) {
       if (!DATA) {
         if (!cutInitPromise) {
           cutInitPromise = init().finally(() => {
@@ -69,7 +71,7 @@
         }
         if (!DATA) return;
       }
-      seek(sceneVid.currentTime);
+      seek(playbackMasterTime());
     }
   }
 
@@ -95,6 +97,35 @@
     return `/media/take/${encodeURIComponent(scene.scene_uid)}/${encodeURIComponent(takeUid)}?token=${token}`;
   }
 
+  function jobMediaUrl(jobId) {
+    const token = encodeURIComponent(window.workbenchToken || "");
+    return `/media/job/${encodeURIComponent(jobId)}?token=${token}`;
+  }
+
+  function bakedPreviewVisible() {
+    return !sceneTakePreview.classList.contains("hidden") && Boolean(sceneTakePreview.dataset.jobId);
+  }
+
+  function activePlaybackVideo() {
+    return bakedPreviewVisible() ? sceneTakePreview : sceneVid;
+  }
+
+  function playbackMasterTime() {
+    if (!bakedPreviewVisible()) return Math.max(0, num(sceneVid.currentTime));
+    return Math.max(0, num(sceneTakePreview.dataset.rangeFrom) + num(sceneTakePreview.currentTime));
+  }
+
+  function seekActivePlayback(masterTime) {
+    const target = Math.max(0, num(masterTime));
+    if (bakedPreviewVisible()) {
+      const fromS = num(sceneTakePreview.dataset.rangeFrom);
+      const toS = num(sceneTakePreview.dataset.rangeTo, fromS + num(sceneTakePreview.duration));
+      sceneTakePreview.currentTime = Math.max(0, Math.min(target, toS) - fromS);
+    } else {
+      sceneVid.currentTime = Math.min(target, S.duration);
+    }
+  }
+
   function applyServerTimeline(data, selectedSceneUid) {
     if (!data.timeline) return;
     S.timeline = data.timeline;
@@ -117,6 +148,10 @@
     if (!scene || !take) return;
     S.previewTakeUid = takeUid;
     sceneVid.pause();
+    sceneTakePreview.muted = true;
+    sceneTakePreview.removeAttribute("data-job-id");
+    sceneTakePreview.removeAttribute("data-range-from");
+    sceneTakePreview.removeAttribute("data-range-to");
     sceneStill.removeAttribute("src");
     sceneStill.className = "hidden";
     const nextUrl = takeMediaUrl(scene, takeUid);
@@ -327,6 +362,7 @@
       renderSceneTimeline();
       renderSceneInspector();
       $("sceneAddBtn").disabled = !S.selectedCatalogId;
+      restoreActiveJob();
       $("sceneCount").textContent = `${S.compositions.length} compositions · ${S.timeline.shots.length} placed scenes`;
       const blocking = applyValidation();
       if (blocking.length) setStatus(`${blocking.length} issue${blocking.length === 1 ? "" : "s"} blocking bake`, "err");
@@ -525,6 +561,7 @@
       <div class="scene-field"><label>Change notes</label><textarea id="sceneNotes" placeholder="Describe the revision you want for Remotion or Hyperframe">${esc(shot.notes || "")}</textarea></div>
       <div class="scene-field"><span class="scene-label">Source</span><div class="scene-source">${esc(engine === "remotion" && comp && comp.source ? `remotion/${comp.source}` : shot.asset || "No external render mapped yet")}</div></div>
       <div class="scene-actions">
+        <button id="sceneRangeBake" class="primary">Preview bake &plusmn;2s</button>
         <button id="sceneJumpStart">Jump to start</button>
         <button id="sceneDuplicate">Duplicate</button>
         <button id="sceneDelete" class="danger">Delete</button>
@@ -567,7 +604,8 @@
     $("sceneEnabled").onchange = (event) => { shot.enabled = event.target.checked; update(`${shot.enabled ? "enabled" : "disabled"} ${shot.id}`, true); };
     $("sceneCue").oninput = (event) => { shot.cue = event.target.value; S.dirty = true; $("sceneSaveBtn").disabled = false; };
     $("sceneNotes").oninput = (event) => { shot.notes = event.target.value; S.dirty = true; $("sceneSaveBtn").disabled = false; };
-    $("sceneJumpStart").onclick = () => { sceneVid.currentTime = num(shot.master_in_s); updateScenePlayhead(); };
+    $("sceneRangeBake").onclick = bakeSelectedRange;
+    $("sceneJumpStart").onclick = () => { seekActivePlayback(num(shot.master_in_s)); updateScenePlayhead(); };
     $("sceneDuplicate").onclick = () => duplicateScene();
     $("sceneDelete").onclick = () => deleteScene();
     wireProjectSettings();
@@ -681,7 +719,7 @@
     });
     const data = await response.json();
     if (!response.ok) { setStatus(data.error || "still render failed", "err"); return; }
-    pollSceneJob("still", () => {
+    pollSceneJob(data.job_id, () => {
       sceneStill.src = `${data.url}?v=${Date.now()}`;
       sceneStill.className = shot.type === "overlay" ? "overlay-preview" : "cutaway-preview";
       $("sceneEmptyPreview").classList.add("hidden");
@@ -700,44 +738,176 @@
     const data = await response.json();
     if (!response.ok) return setStatus(data.error || "render could not start", "err");
     setStatus(`rendering ${shot.id}...`);
-    pollSceneJob("render");
+    pollSceneJob(data.job_id);
   }
 
   async function bakeScenePreview() {
-    if (!(await saveScenes())) return;
+    if (S.dirty && !(await saveScenes())) return;
     const response = await fetch("/api/scenes/bake", {method: "POST", headers: {"Content-Type": "application/json", "If-Match": S.etag}, body: "{}"});
     const data = await response.json();
     if (!response.ok) return setStatus(data.error || "bake could not start", "err");
     setStatus("baking full scene preview...");
-    pollSceneJob("bake");
+    pollSceneJob(data.job_id, showBakedJobPreview);
   }
 
-  function pollSceneJob(kind, onSuccess) {
-    const timer = setInterval(async () => {
-      const response = await fetch("/api/scenes/jobs");
-      const jobs = await response.json();
-      const job = jobs[kind];
-      const tail = (job.log || "").trim().split("\n").slice(-8).join("\n");
-      $("sceneJobLog").textContent = tail || `${kind} job running...`;
-      $("sceneJobLog").scrollTop = $("sceneJobLog").scrollHeight;
-      if (job.running) return;
-      clearInterval(timer);
-      if (job.ok) {
-        if (onSuccess) onSuccess(job);
-        const suffix = kind === "bake" && job.output ? ` · ${job.output}` : "";
-        setStatus(`${kind} complete${suffix}`, "ok");
-      } else {
-        setStatus(`${kind} failed - see job log`, "err");
+  async function bakeSelectedRange() {
+    let shot = activeScene();
+    if (!shot) return setStatus("select a scene to preview its bake range", "err");
+    if (S.dirty && !(await saveScenes())) return;
+    shot = activeScene();
+    if (!shot) return;
+    const previewEnd = num(S.timeline.preview && S.timeline.preview.end_s, S.duration);
+    const fromS = round3(Math.max(0, num(shot.master_in_s) - 2));
+    const toS = round3(Math.min(previewEnd, num(shot.master_out_s) + 2));
+    const response = await fetch("/api/bake/range", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "If-Match": S.etag},
+      body: JSON.stringify({from_s: fromS, to_s: toS}),
+    });
+    const data = await response.json();
+    if (!response.ok) return setStatus(data.error || "range bake could not start", "err");
+    setStatus(`baking ${fmt(fromS)}-${fmt(toS)} around ${shot.id}...`);
+    pollSceneJob(data.job_id, showBakedJobPreview);
+  }
+
+  function renderJobChip(job) {
+    const chip = $("sceneJobChip");
+    const label = $("sceneJobLabel");
+    const cancel = $("sceneJobCancel");
+    chip.classList.remove("idle", "running", "succeeded", "failed", "canceled");
+    if (!job) {
+      chip.classList.add("idle");
+      label.textContent = "Jobs idle";
+      cancel.classList.add("hidden");
+      chip.title = "No render or bake job is active";
+      return;
+    }
+    const state = job.state || "queued";
+    const active = ["queued", "submitted", "running"].includes(state);
+    const pct = Math.round(num(job.progress) * 100);
+    chip.classList.add(active ? "running" : state);
+    label.textContent = active
+      ? `${job.kind || "job"} ${pct}% \u00b7 ${job.message || state}`
+      : `${job.kind || "job"} ${state}`;
+    cancel.classList.toggle("hidden", !active || !job.pid || !job.start_token);
+    chip.title = `${job.job_id} \u00b7 ${job.message || state}`;
+  }
+
+  async function pollDurableJob(jobId, onSuccess) {
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+      const data = await response.json();
+      const job = data.job;
+      if (!job) throw new Error("durable job record was not found");
+      S.currentJob = job;
+      renderJobChip(job);
+      if (["queued", "submitted", "running"].includes(job.state)) {
+        S.jobPollTimer = setTimeout(() => pollDurableJob(jobId, onSuccess), 700);
+        return;
       }
-    }, 900);
+      S.jobPollTimer = null;
+      if (job.state === "succeeded") {
+        if (onSuccess) onSuccess(job);
+        setStatus(`${job.kind} complete`, "ok");
+      } else if (job.state === "canceled") {
+        setStatus(`${job.kind} canceled`, "err");
+      } else {
+        setStatus(`${job.kind} ${job.state}: ${job.message || "job did not complete"}`, "err");
+      }
+    } catch (error) {
+      S.jobPollTimer = null;
+      renderJobChip(null);
+      setStatus(`job polling failed: ${error.message}`, "err");
+    }
+  }
+
+  function trackJob(jobId, onSuccess) {
+    if (S.jobPollTimer) clearTimeout(S.jobPollTimer);
+    S.currentJob = {job_id: jobId, kind: "job", state: "queued", progress: 0, message: "queued"};
+    renderJobChip(S.currentJob);
+    pollDurableJob(jobId, onSuccess);
+  }
+
+  function pollSceneJob(jobId, onSuccess) {
+    trackJob(jobId, onSuccess);
+  }
+
+  async function cancelCurrentJob() {
+    let job = S.currentJob;
+    if (!job || !["queued", "submitted", "running"].includes(job.state)) return;
+    setStatus(`canceling ${job.kind}...`);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(job.job_id)}/cancel`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "If-Match": job.updated_at || ""},
+        body: "{}",
+      });
+      const data = await response.json();
+      if (response.ok) {
+        S.currentJob = data.job;
+        renderJobChip(data.job);
+        setStatus(`${data.job.kind} canceled`, "err");
+        return;
+      }
+      if (data.code === "E_JOB_TOKEN_MISMATCH" && data.details && data.details.job) {
+        job = data.details.job;
+        S.currentJob = job;
+        continue;
+      }
+      setStatus(data.error || "job could not be canceled", "err");
+      return;
+    }
+    setStatus("job changed while canceling; try again", "err");
+  }
+
+  async function restoreActiveJob() {
+    try {
+      const response = await fetch("/api/jobs");
+      const data = await response.json();
+      const active = (data.jobs || []).find((job) => ["queued", "submitted", "running"].includes(job.state));
+      if (active) {
+        trackJob(active.job_id, active.kind === "bake" ? showBakedJobPreview : null);
+        return;
+      }
+      const latestBake = (data.jobs || []).find((job) => job.kind === "bake" && job.state === "succeeded");
+      if (latestBake) {
+        S.currentJob = latestBake;
+        renderJobChip(latestBake);
+        showBakedJobPreview(latestBake);
+      } else {
+        renderJobChip(null);
+      }
+    } catch (_error) {
+      renderJobChip(null);
+    }
+  }
+
+  function showBakedJobPreview(job) {
+    clearSceneStill();
+    sceneVid.pause();
+    sceneTakePreview.muted = false;
+    sceneTakePreview.src = jobMediaUrl(job.job_id);
+    sceneTakePreview.removeAttribute("data-take-uid");
+    sceneTakePreview.dataset.jobId = job.job_id;
+    sceneTakePreview.dataset.rangeFrom = num(job.range && job.range.from_s);
+    sceneTakePreview.dataset.rangeTo = num(job.range && job.range.to_s, num(S.timeline.preview && S.timeline.preview.end_s, S.duration));
+    sceneTakePreview.classList.remove("hidden");
+    $("sceneEmptyPreview").classList.add("hidden");
+    $("sceneClearPreviewBtn").disabled = false;
+    sceneTakePreview.load();
+    sceneTakePreview.play().catch(() => {});
   }
 
   function clearSceneStill() {
     S.previewTakeUid = null;
     S.compare = null;
     sceneTakePreview.pause();
+    sceneTakePreview.muted = true;
     sceneTakePreview.removeAttribute("src");
     sceneTakePreview.removeAttribute("data-take-uid");
+    sceneTakePreview.removeAttribute("data-job-id");
+    sceneTakePreview.removeAttribute("data-range-from");
+    sceneTakePreview.removeAttribute("data-range-to");
     sceneTakePreview.load();
     sceneTakePreview.className = "hidden";
     sceneStill.removeAttribute("src");
@@ -749,11 +919,15 @@
   }
 
   function updateScenePlayhead() {
-    const time = Math.max(0, num(sceneVid.currentTime));
+    const playback = activePlaybackVideo();
+    const time = playbackMasterTime();
+    if (playback === sceneTakePreview && Math.abs(num(sceneVid.currentTime) - time) > .05) {
+      sceneVid.currentTime = Math.min(time, S.duration);
+    }
     $("scenePlayhead").style.left = `${time * S.pps}px`;
     $("sceneTimeinfo").textContent = `${fmt(time)} · ${S.project || "scene timeline"}`;
     updateSceneFrameLabel();
-    if (!sceneVid.paused && document.body.dataset.workspace === "scenes") {
+    if (!playback.paused && document.body.dataset.workspace === "scenes") {
       const x = time * S.pps - sceneTimeline.scrollLeft;
       if (x > sceneTimeline.clientWidth * .85 || x < 0) sceneTimeline.scrollLeft = time * S.pps - sceneTimeline.clientWidth * .15;
     }
@@ -768,6 +942,7 @@
     $("sceneSaveBtn").onclick = saveScenes;
     $("sceneRenderBtn").onclick = renderSelectedScene;
     $("sceneBakeBtn").onclick = bakeScenePreview;
+    $("sceneJobCancel").onclick = cancelCurrentJob;
     $("sceneFrameBtn").onclick = renderCurrentFrame;
     $("sceneClearPreviewBtn").onclick = clearSceneStill;
     $("sceneTakeInput").onchange = (event) => importTake(event.target.files && event.target.files[0]);
@@ -775,14 +950,18 @@
       button.onclick = () => showCompareSide(button.dataset.compareSide);
     });
     $("sceneCompareClose").onclick = closeCompare;
-    $("scenePlayBtn").onclick = () => sceneVid.paused ? sceneVid.play() : sceneVid.pause();
+    $("scenePlayBtn").onclick = () => {
+      const playback = activePlaybackVideo();
+      playback.paused ? playback.play() : playback.pause();
+    };
     $("sceneZoom").oninput = (event) => {
-      const center = num(sceneVid.currentTime);
+      const center = playbackMasterTime();
       S.pps = num(event.target.value, 8);
       renderSceneTimeline();
       sceneTimeline.scrollLeft = center * S.pps - sceneTimeline.clientWidth / 2;
     };
     sceneVid.addEventListener("timeupdate", updateScenePlayhead);
+    sceneTakePreview.addEventListener("timeupdate", updateScenePlayhead);
 
     sceneInner.addEventListener("mousedown", (event) => {
       const block = event.target.closest(".scene-block");
@@ -803,7 +982,7 @@
         return;
       }
       const rect = sceneInner.getBoundingClientRect();
-      sceneVid.currentTime = Math.max(0, Math.min((event.clientX - rect.left) / S.pps, S.duration));
+      seekActivePlayback(Math.max(0, Math.min((event.clientX - rect.left) / S.pps, S.duration)));
       updateScenePlayhead();
     });
 
@@ -832,12 +1011,17 @@
     document.addEventListener("keydown", (event) => {
       if (document.body.dataset.workspace !== "scenes") return;
       if (["INPUT", "SELECT", "TEXTAREA"].includes(event.target.tagName)) return;
-      if (event.key === " ") { event.preventDefault(); sceneVid.paused ? sceneVid.play() : sceneVid.pause(); }
-      else if (event.key === "ArrowLeft") sceneVid.currentTime = Math.max(0, sceneVid.currentTime - (event.shiftKey ? 10 : 2));
-      else if (event.key === "ArrowRight") sceneVid.currentTime = Math.min(S.duration, sceneVid.currentTime + (event.shiftKey ? 10 : 2));
-      else if (event.key === ",") sceneVid.currentTime = Math.max(0, sceneVid.currentTime - 1 / 60);
-      else if (event.key === ".") sceneVid.currentTime = Math.min(S.duration, sceneVid.currentTime + 1 / 60);
+      if (event.key === " ") {
+        event.preventDefault();
+        const playback = activePlaybackVideo();
+        playback.paused ? playback.play() : playback.pause();
+      }
+      else if (event.key === "ArrowLeft") seekActivePlayback(playbackMasterTime() - (event.shiftKey ? 10 : 2));
+      else if (event.key === "ArrowRight") seekActivePlayback(playbackMasterTime() + (event.shiftKey ? 10 : 2));
+      else if (event.key === ",") seekActivePlayback(playbackMasterTime() - 1 / 60);
+      else if (event.key === ".") seekActivePlayback(playbackMasterTime() + 1 / 60);
       else if (event.key.toLowerCase() === "a") addSceneAtPlayhead();
+      else if (event.key.toLowerCase() === "b" && activeScene()) bakeSelectedRange();
       else if (event.key.toLowerCase() === "v" && activeScene()) {
         S.takesOpen = !S.takesOpen;
         renderTakesDrawer();

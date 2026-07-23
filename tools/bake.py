@@ -9,16 +9,17 @@ bakes a flat preview:
   - 'overlay' spans COMPOSITE an alpha shot (.mov, ProRes 4444) over the master;
   - everywhere else the master video passes through.
 
-Method: split [0, end] into atomic segments at every shot boundary, render each
-segment to an identically-encoded clip, concat them, then mux master audio 0..end.
+Method: split [start, end] into atomic segments at every shot boundary, render each
+segment to an identically-encoded clip, concat them, then mux matching master audio.
 Frame-accurate: per-segment frame counts come from rounded cumulative boundaries so
 the total matches the audio exactly (no cumulative drift).
 
 Usage:
-  python tools/bake.py [videos/video-1/work/timeline.json] [--end SECONDS] [--keep]
+  python tools/bake.py [videos/video-1/work/timeline.json] [--from SECONDS] [--end SECONDS] [--keep]
   python tools/bake.py [videos/video-1/work/timeline.json] --check
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -46,6 +47,44 @@ def run(cmd):
     return r.stdout
 
 
+def range_label(value):
+    """Stable, filesystem-safe decimal label for a range boundary."""
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def validate_baked_output(path, expected_duration):
+    """Reject incomplete or mistimed output before it replaces a known-good bake."""
+    raw = run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=codec_type,duration",
+        "-of", "json", path,
+    ])
+    try:
+        report = json.loads(raw)
+        duration = float(report["format"]["duration"])
+        stream_types = {
+            stream.get("codec_type")
+            for stream in report.get("streams", [])
+            if isinstance(stream, dict)
+        }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit("bake validation failed: ffprobe returned invalid metadata") from exc
+    if not math.isfinite(duration) or abs(duration - expected_duration) > 0.1:
+        raise SystemExit(
+            f"bake validation failed: expected {expected_duration:.3f}s, got {duration:.3f}s"
+        )
+    missing = {"video", "audio"} - stream_types
+    if missing:
+        raise SystemExit(f"bake validation failed: missing {', '.join(sorted(missing))} stream")
+    return duration
+
+
+def publish_validated_bake(partial_path, out_path, expected_duration):
+    duration = validate_baked_output(partial_path, expected_duration)
+    os.replace(partial_path, out_path)
+    return duration
+
+
 def main():
     args = sys.argv[1:]
     keep = "--keep" in args
@@ -57,12 +96,19 @@ def main():
         i = args.index("--end")
         end_override = float(args[i + 1])
         del args[i:i + 2]
+    from_override = None
+    if "--from" in args:
+        i = args.index("--from")
+        from_override = float(args[i + 1])
+        del args[i:i + 2]
     tl_path = proj(args[0]) if args else proj(os.path.join("video-1", "work", "timeline.json"))
 
     with open(tl_path, "r", encoding="utf-8") as f:
         tl = json.load(f)
 
-    project = Path(tl_path).resolve().parent.parent
+    resolved_timeline = Path(tl_path).resolve()
+    work_dir = next((parent for parent in resolved_timeline.parents if parent.name == "work"), None)
+    project = work_dir.parent if work_dir is not None else resolved_timeline.parent.parent
     manifest_path = Path(ROOT) / "remotion" / "src" / "shots.manifest.json"
     try:
         catalog_items = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -82,10 +128,22 @@ def main():
     master = proj(tl["master"])                                     # project data -> CWD
     out_dir = os.path.join(ROOT, tl.get("remotion_out", "remotion/out"))  # engine -> ROOT
     pv = tl["preview"]
+    START = from_override if from_override is not None else 0.0
     END = end_override if end_override is not None else float(pv["end_s"])
+    if START < 0:
+        raise SystemExit("--from must be >= 0")
+    if END <= START:
+        raise SystemExit("--end must be greater than --from")
     W, H, FPS = int(pv["width"]), int(pv["height"]), int(pv["fps"])
-    out_path = proj(pv["out"])                                      # project data -> CWD
+    if from_override is not None:
+        out_path = str(
+            project / "work" / "preview"
+            / f"range-{range_label(START)}-{range_label(END)}.mp4"
+        )
+    else:
+        out_path = proj(pv["out"])                                  # project data -> CWD
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    print("PROGRESS 0.020 preparing", flush=True)
 
     # Resolve each shot to its rendered file. Remotion shots use the historical
     # remotion/out/<id> convention. Other engines (Hyperframe exports, stock
@@ -95,7 +153,8 @@ def main():
     for s in tl["shots"]:
         if not s.get("enabled", True):
             continue
-        a = max(0.0, float(s["master_in_s"]))
+        source_in = float(s["master_in_s"])
+        a = max(START, source_in)
         b = min(END, float(s["master_out_s"]))
         if b <= a:
             continue  # entirely past the preview window
@@ -105,26 +164,30 @@ def main():
             hint = (f"export the {s.get('engine', 'external')} scene to its asset path"
                     if s.get("asset") else f"render it first: npm run render / render-all {s['id']}")
             raise SystemExit(f"missing rendered shot: {f} ({hint})")
-        shots.append({"id": s["id"], "type": s["type"], "in": a, "out": b, "file": f})
+        shots.append({
+            "id": s["id"], "type": s["type"], "in": a, "out": b,
+            "source_in": source_in, "file": f,
+        })
 
     cutaways = [s for s in shots if s["type"] == "cutaway"]
     overlays = [s for s in shots if s["type"] == "overlay"]
 
     # atomic segment boundaries
-    bounds = {0.0, END}
+    bounds = {START, END}
     for s in shots:
         bounds.add(s["in"])
         bounds.add(s["out"])
-    bounds = sorted(b for b in bounds if 0.0 <= b <= END)
+    bounds = sorted(b for b in bounds if START <= b <= END)
 
-    scratch = os.path.join(os.path.dirname(out_path), "_bake_tmp")
+    scratch = os.path.join(os.path.dirname(out_path), f"_bake_tmp_{os.getpid()}")
     if os.path.exists(scratch):
         shutil.rmtree(scratch)
     os.makedirs(scratch)
 
     seg_files = []
-    print(f"master={os.path.relpath(master, ROOT)}  end={END}s  {W}x{H}@{FPS}")
+    print(f"master={os.path.relpath(master, ROOT)}  range={START}-{END}s  {W}x{H}@{FPS}")
     print("segments:")
+    segment_total = max(1, len(bounds) - 1)
     for i in range(len(bounds) - 1):
         a, b = bounds[i], bounds[i + 1]
         if b - a < 1e-4:
@@ -142,13 +205,13 @@ def main():
         common_vf = f"scale={W}:{H}:force_original_aspect_ratio=disable,fps={FPS},tpad=stop_mode=clone:stop_duration=1,format=yuv420p"
 
         if cut:
-            off = a - cut["in"]
+            off = a - cut["source_in"]
             kind = f"cutaway:{cut['id']} @+{off:.2f}s"
             cmd = ["ffmpeg", "-y", "-ss", f"{off:.4f}", "-i", cut["file"],
                    "-vf", common_vf, "-frames:v", str(n), "-an",
                    "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", seg]
         elif ov:
-            off = a - ov["in"]
+            off = a - ov["source_in"]
             kind = f"master+overlay:{ov['id']} @+{off:.2f}s"
             fc = (f"[0:v]scale={W}:{H},fps={FPS},format=yuv420p[bg];"
                   f"[1:v]scale={W}:{H},fps={FPS}[ov];"
@@ -167,6 +230,10 @@ def main():
         print(f"  [{a:6.2f}-{b:6.2f}] {n:4d}f  {kind}")
         run(cmd)
         seg_files.append(seg)
+        print(f"PROGRESS {0.05 + 0.75 * ((i + 1) / segment_total):.4f} segment {i + 1}/{segment_total}", flush=True)
+
+    if not seg_files:
+        raise SystemExit("range contains no video frames")
 
     # concat (re-encode) + mux master audio 0..END
     listf = os.path.join(scratch, "segs.txt")
@@ -175,18 +242,24 @@ def main():
             f.write(f"file '{s.replace(os.sep, '/')}'\n")
 
     print("concat + master audio -> " + os.path.relpath(out_path, ROOT))
-    run(["ffmpeg", "-y",
-         "-f", "concat", "-safe", "0", "-i", listf,
-         "-i", master,
-         "-map", "0:v:0", "-map", "1:a:0",
-         "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p", "-r", str(FPS),
-         "-c:a", "aac", "-b:a", "192k",
-         "-t", f"{END:.4f}", "-movflags", "+faststart", out_path])
+    print("PROGRESS 0.850 muxing", flush=True)
+    partial_path = os.path.join(scratch, "publish.mp4")
+    try:
+        run(["ffmpeg", "-y",
+             "-f", "concat", "-safe", "0", "-i", listf,
+             "-ss", f"{START:.4f}", "-i", master,
+             "-map", "0:v:0", "-map", "1:a:0",
+             "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p", "-r", str(FPS),
+             "-c:a", "aac", "-b:a", "192k",
+             "-t", f"{END - START:.4f}", "-movflags", "+faststart", partial_path])
+        dur = publish_validated_bake(partial_path, out_path, END - START)
+    finally:
+        if os.path.exists(partial_path):
+            os.unlink(partial_path)
 
     if not keep:
         shutil.rmtree(scratch)
-    dur = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-               "-of", "default=nw=1:nk=1", out_path]).strip()
+    print("PROGRESS 0.980 verified; publishing artifact", flush=True)
     print(f"done -> {os.path.relpath(out_path, ROOT)}  ({dur}s)")
 
 
