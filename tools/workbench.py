@@ -19,6 +19,8 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
+from project_bootstrap import BootstrapError, bootstrap_project
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -94,9 +96,27 @@ def open_when_ready(base_url: str, page_url: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start the AI video workbench and open one browser tab.")
     parser.add_argument("project", nargs="?", default="video-1", help="project name/path (default: video-1)")
+    parser.add_argument("--new-project", metavar="NAME", help="create and open a VO-first project")
+    parser.add_argument("--vo", type=Path, help="voiceover WAV for --new-project")
+    parser.add_argument("--assets", type=Path, help="optional media folder for --new-project")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-open", action="store_true", help="start the server without opening a browser")
     args = parser.parse_args()
+
+    if args.new_project:
+        if args.project != "video-1":
+            parser.error("do not provide a positional project with --new-project")
+        if args.vo is None:
+            parser.error("--new-project requires --vo")
+        try:
+            project = bootstrap_project(args.new_project, args.vo, args.assets)
+        except BootstrapError as exc:
+            parser.error(str(exc))
+        args.project = args.new_project
+    elif args.vo is not None or args.assets is not None:
+        parser.error("--vo and --assets require --new-project")
+    else:
+        project = resolve_project(args.project)
 
     port = args.port
     base_url = f"http://127.0.0.1:{port}"
@@ -117,7 +137,6 @@ def main() -> int:
         base_url = f"http://127.0.0.1:{port}"
         page_url = base_url + "/?workspace=scenes"
 
-    project = resolve_project(args.project)
     cuts = project / "work" / "analysis" / "cuts.json"
     proxy = project / "work" / "editor" / "proxy.mp4"
 

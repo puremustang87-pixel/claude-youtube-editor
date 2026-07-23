@@ -10,7 +10,16 @@ if grep -qi microsoft /proc/version 2>/dev/null && command -v python.exe >/dev/n
   if [ "$#" -eq 0 ]; then
     set -- video-1
   fi
-  exec python.exe "$WINDOWS_LAUNCHER" "$@"
+  ARGS=("$@")
+  for ((i = 0; i < ${#ARGS[@]}; i++)); do
+    if [[ "${ARGS[$i]}" == "--vo" || "${ARGS[$i]}" == "--assets" ]]; then
+      i=$((i + 1))
+      if ((i < ${#ARGS[@]})); then
+        ARGS[$i]="$(wslpath -w -a "${ARGS[$i]}")"
+      fi
+    fi
+  done
+  exec python.exe "$WINDOWS_LAUNCHER" "${ARGS[@]}"
 fi
 
 PYTHON_BIN=python3

@@ -36,6 +36,11 @@ BAKE_SPEC = importlib.util.spec_from_file_location("video_workbench_bake", BAKE_
 BAKE = importlib.util.module_from_spec(BAKE_SPEC)
 assert BAKE_SPEC and BAKE_SPEC.loader
 BAKE_SPEC.loader.exec_module(BAKE)
+BOOTSTRAP_PATH = SERVER.ROOT / "tools" / "project_bootstrap.py"
+BOOTSTRAP_SPEC = importlib.util.spec_from_file_location("video_project_bootstrap", BOOTSTRAP_PATH)
+BOOTSTRAP = importlib.util.module_from_spec(BOOTSTRAP_SPEC)
+assert BOOTSTRAP_SPEC and BOOTSTRAP_SPEC.loader
+BOOTSTRAP_SPEC.loader.exec_module(BOOTSTRAP)
 TEST_CATALOG = [
     {"id": "BrandProof", "durationInFrames": 300, "fps": 60, "width": 1920, "height": 1080},
     {"id": "BigStatement", "durationInFrames": 300, "fps": 60, "width": 1920, "height": 1080},
@@ -1547,6 +1552,113 @@ class TimelineTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             report = json.loads(result.stdout)
             self.assertEqual(report["issues"][0]["code"], "W_SCENE_DISABLED")
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe required")
+class VoiceoverBootstrapTests(unittest.TestCase):
+    def make_wav(self, path: Path, duration: float = 0.8) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-t", str(duration), "-c:a", "pcm_s16le", str(path),
+        ], check=True)
+
+    def test_scaffold_master_and_unmodified_bake(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-vo-") as folder:
+            root = Path(folder)
+            vo = root / "owner-vo.wav"
+            self.make_wav(vo)
+            project = BOOTSTRAP.bootstrap_project(
+                "launch-video", vo, root=root, transcribe=False
+            )
+
+            metadata = json.loads((project / "work" / "project.json").read_text(encoding="utf-8"))
+            timeline = json.loads((project / "work" / "timeline.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["master"]["kind"], "vo_synth")
+            self.assertEqual(metadata["master"]["base_track"]["kind"], "brand_slate")
+            self.assertEqual(timeline["master_fps"], 30)
+            self.assertEqual(timeline["shots"], [])
+            self.assertTrue((project / "work" / "audio" / vo.name).is_file())
+
+            master_probe = BOOTSTRAP.probe(project / "work" / "master.mp4")
+            self.assertTrue(master_probe["has_video"])
+            self.assertTrue(master_probe["has_audio"])
+            self.assertLessEqual(abs(master_probe["duration_s"] - 0.8), 0.05)
+            self.assertLessEqual(
+                abs(master_probe["video_duration_s"] - master_probe["audio_duration_s"]), 0.05
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(BAKE_PATH), str(project / "work" / "timeline.json")],
+                cwd=root, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertTrue(project.joinpath("output", "launch-video-preview.mp4").is_file())
+
+    def test_assets_are_conformed_cataloged_and_rerun_is_idempotent(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-assets-") as folder:
+            root = Path(folder)
+            vo = root / "voice.wav"
+            self.make_wav(vo)
+            assets = root / "owner-assets"
+            assets.mkdir()
+            shutil.copy2(vo, assets / "music.wav")
+            shutil.copy2(SERVER.ROOT / "tools" / "fixtures" / "good_a.png", assets / "diagram.png")
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24",
+                "-t", "0.5", "-pix_fmt", "yuv420p", str(assets / "clip.mp4"),
+            ], check=True)
+
+            project = BOOTSTRAP.bootstrap_project(
+                "asset-video", vo, assets, root=root, transcribe=False
+            )
+            catalog_path = project / "work" / "assets.json"
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self.assertEqual({item["class"] for item in catalog["assets"]}, {"audio", "image", "video"})
+            for item in catalog["assets"]:
+                self.assertIn("sha256", item)
+                self.assertIn("original_name", item)
+                conformed = root / item["file"]
+                self.assertTrue(conformed.is_file())
+                media_probe = BOOTSTRAP.probe(conformed)
+                if item["class"] in {"image", "video"}:
+                    self.assertEqual((media_probe["width"], media_probe["height"]), (1920, 1080))
+                if item["class"] == "video":
+                    self.assertEqual(media_probe["fps"], "30/1")
+                if item["class"] == "audio":
+                    self.assertEqual(media_probe["sample_rate"], 48000)
+
+            timeline_path = project / "work" / "timeline.json"
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+            timeline["owner_marker"] = "keep me"
+            timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
+            master_mtime = (project / "work" / "master.mp4").stat().st_mtime_ns
+
+            BOOTSTRAP.bootstrap_project(
+                "asset-video", vo, assets, root=root, transcribe=False
+            )
+            rerun_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            rerun_timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(rerun_catalog["assets"]), 3)
+            self.assertEqual(rerun_timeline["owner_marker"], "keep me")
+            self.assertEqual((project / "work" / "master.mp4").stat().st_mtime_ns, master_mtime)
+
+    def test_transcript_words_are_exposed_as_ruler_ticks(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-words-") as folder:
+            transcript = Path(folder) / "edited-transcript.json"
+            transcript.write_text(json.dumps({
+                "words": [
+                    {"text": "Hello", "start": 125, "end": 420},
+                    {"text": "world", "start": 500, "end": 900},
+                    {"text": "bad"},
+                ],
+            }), encoding="utf-8")
+            self.assertEqual(SERVER.transcript_word_ticks(transcript), [
+                {"text": "Hello", "start_s": 0.125, "end_s": 0.42},
+                {"text": "world", "start_s": 0.5, "end_s": 0.9},
+            ])
 
 
 if __name__ == "__main__":
