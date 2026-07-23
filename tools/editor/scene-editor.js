@@ -142,6 +142,14 @@
     applyValidation();
   }
 
+  async function refreshSceneData(selectedSceneUid) {
+    const response = await fetch("/api/scenes");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "could not refresh scenes");
+    applyServerTimeline(data, selectedSceneUid);
+    return data;
+  }
+
   function showTakePreview(takeUid) {
     const scene = activeScene();
     const take = (scene && scene.takes || []).find((item) => item.take_uid === takeUid);
@@ -337,6 +345,45 @@
     showTakePreview(takeUid);
     renderCompareControls();
     setStatus("take promoted · timeline asset updated", "ok");
+  }
+
+  function openGenerateDialog() {
+    const shot = activeScene();
+    if (!shot || !["fable", "hyperframe"].includes(shot.engine)) return;
+    $("sceneGeneratePrompt").value = shot.notes || shot.cue || "";
+    $("sceneGenerateDuration").value = round3(Math.max(.05, num(shot.master_out_s) - num(shot.master_in_s)));
+    $("sceneGenerateProvider").textContent = `· ${shot.engine}`;
+    $("sceneGenerateDialog").showModal();
+    $("sceneGeneratePrompt").focus();
+  }
+
+  async function submitGeneration(event) {
+    event.preventDefault();
+    let shot = activeScene();
+    if (!shot || !["fable", "hyperframe"].includes(shot.engine)) return;
+    const prompt = $("sceneGeneratePrompt").value.trim();
+    const durationS = num($("sceneGenerateDuration").value);
+    if (!prompt || durationS <= 0) return setStatus("generation needs a prompt and duration", "err");
+    if (S.dirty && !(await saveScenes())) return;
+    shot = activeScene();
+    if (!shot) return;
+    const sceneUid = shot.scene_uid;
+    setStatus(`submitting ${shot.engine} generation…`);
+    const response = await fetch(`/api/scene/${encodeURIComponent(sceneUid)}/revise`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "If-Match": S.etag},
+      body: JSON.stringify({
+        prompt,
+        duration_s: durationS,
+        provider_hint: shot.engine,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) return setStatus(data.error || "generation could not be submitted", "err");
+    $("sceneGenerateDialog").close();
+    applyServerTimeline(data, sceneUid);
+    setStatus(`generation submitted · drop fulfillment into work/inbox/${data.job_id}`, "ok");
+    trackJob(data.job_id);
   }
 
   async function initScenes() {
@@ -561,6 +608,7 @@
       <div class="scene-field"><label>Change notes</label><textarea id="sceneNotes" placeholder="Describe the revision you want for Remotion or Hyperframe">${esc(shot.notes || "")}</textarea></div>
       <div class="scene-field"><span class="scene-label">Source</span><div class="scene-source">${esc(engine === "remotion" && comp && comp.source ? `remotion/${comp.source}` : shot.asset || "No external render mapped yet")}</div></div>
       <div class="scene-actions">
+        ${["fable", "hyperframe"].includes(engine) ? '<button id="sceneGenerateBtn" class="primary">Revise → submit generation</button>' : ""}
         <button id="sceneRangeBake" class="primary">Preview bake &plusmn;2s</button>
         <button id="sceneJumpStart">Jump to start</button>
         <button id="sceneDuplicate">Duplicate</button>
@@ -604,6 +652,7 @@
     $("sceneEnabled").onchange = (event) => { shot.enabled = event.target.checked; update(`${shot.enabled ? "enabled" : "disabled"} ${shot.id}`, true); };
     $("sceneCue").oninput = (event) => { shot.cue = event.target.value; S.dirty = true; $("sceneSaveBtn").disabled = false; };
     $("sceneNotes").oninput = (event) => { shot.notes = event.target.value; S.dirty = true; $("sceneSaveBtn").disabled = false; };
+    if ($("sceneGenerateBtn")) $("sceneGenerateBtn").onclick = openGenerateDialog;
     $("sceneRangeBake").onclick = bakeSelectedRange;
     $("sceneJumpStart").onclick = () => { seekActivePlayback(num(shot.master_in_s)); updateScenePlayhead(); };
     $("sceneDuplicate").onclick = () => duplicateScene();
@@ -783,13 +832,14 @@
       return;
     }
     const state = job.state || "queued";
-    const active = ["queued", "submitted", "running"].includes(state);
+    const active = ["queued", "submitted", "running", "awaiting_pick"].includes(state);
     const pct = Math.round(num(job.progress) * 100);
     chip.classList.add(active ? "running" : state);
     label.textContent = active
       ? `${job.kind || "job"} ${pct}% \u00b7 ${job.message || state}`
       : `${job.kind || "job"} ${state}`;
-    cancel.classList.toggle("hidden", !active || !job.pid || !job.start_token);
+    const cancellable = active && (job.kind === "generate" || (job.pid && job.start_token));
+    cancel.classList.toggle("hidden", !cancellable);
     chip.title = `${job.job_id} \u00b7 ${job.message || state}`;
   }
 
@@ -807,8 +857,12 @@
       }
       S.jobPollTimer = null;
       if (job.state === "succeeded") {
+        if (job.kind === "generate") await refreshSceneData(job.scene_uid);
         if (onSuccess) onSuccess(job);
         setStatus(`${job.kind} complete`, "ok");
+      } else if (job.state === "awaiting_pick") {
+        await refreshSceneData(job.scene_uid);
+        setStatus("generated candidate ready in Takes · preview or promote it", "ok");
       } else if (job.state === "canceled") {
         setStatus(`${job.kind} canceled`, "err");
       } else {
@@ -834,7 +888,7 @@
 
   async function cancelCurrentJob() {
     let job = S.currentJob;
-    if (!job || !["queued", "submitted", "running"].includes(job.state)) return;
+    if (!job || !["queued", "submitted", "running", "awaiting_pick"].includes(job.state)) return;
     setStatus(`canceling ${job.kind}...`);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const response = await fetch(`/api/jobs/${encodeURIComponent(job.job_id)}/cancel`, {
@@ -864,7 +918,7 @@
     try {
       const response = await fetch("/api/jobs");
       const data = await response.json();
-      const active = (data.jobs || []).find((job) => ["queued", "submitted", "running"].includes(job.state));
+      const active = (data.jobs || []).find((job) => ["queued", "submitted", "running", "awaiting_pick"].includes(job.state));
       if (active) {
         trackJob(active.job_id, active.kind === "bake" ? showBakedJobPreview : null);
         return;
@@ -946,6 +1000,7 @@
     $("sceneFrameBtn").onclick = renderCurrentFrame;
     $("sceneClearPreviewBtn").onclick = clearSceneStill;
     $("sceneTakeInput").onchange = (event) => importTake(event.target.files && event.target.files[0]);
+    $("sceneGenerateSubmit").onclick = submitGeneration;
     $("sceneCompareControls").querySelectorAll("[data-compare-side]").forEach((button) => {
       button.onclick = () => showCompareSide(button.dataset.compareSide);
     });

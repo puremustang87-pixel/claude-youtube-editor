@@ -131,6 +131,7 @@ PROXY = PROJECT / "work" / "editor" / "proxy.mp4"
 EDITOR_MANIFEST = PROJECT / "work" / "editor" / "manifest.json"
 TIMELINE = PROJECT / "work" / "timeline.json"
 JOBS_DIR = PROJECT / "work" / "jobs"
+INBOX_DIR = PROJECT / "work" / "inbox"
 
 MEDIA = {
     "/media/proxy.mp4": (PROXY, "video/mp4"),
@@ -159,6 +160,8 @@ FFPROBE_TIMEOUT_S = max(1.0, float(os.environ.get("CYE_FFPROBE_TIMEOUT_S", 120))
 FFMPEG_TIMEOUT_S = max(1.0, float(os.environ.get("CYE_FFMPEG_TIMEOUT_S", 7200)))
 MAX_CONCURRENT_CONFORMS = max(1, min(8, int(os.environ.get("CYE_MAX_CONCURRENT_CONFORMS", 2))))
 conform_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONFORMS)
+COURIER_POLL_SECONDS = max(0.1, float(os.environ.get("CYE_COURIER_POLL_SECONDS", 0.5)))
+COURIER_SETTLE_SECONDS = max(0.0, float(os.environ.get("CYE_COURIER_SETTLE_SECONDS", 0.25)))
 
 
 class ApiError(Exception):
@@ -787,6 +790,278 @@ def read_job(job_id: str) -> dict | None:
         return None
 
 
+def find_scene(timeline: dict, scene_uid: str) -> dict | None:
+    return next((
+        scene for scene in timeline.get("shots", [])
+        if isinstance(scene, dict) and scene.get("scene_uid") == scene_uid
+    ), None)
+
+
+def allocate_take_dir(scene_uid: str) -> tuple[str, Path]:
+    for _ in range(4):
+        take_uid = new_uid("take")
+        destination = project_write_path(PROJECT / "work" / "generated" / scene_uid / take_uid)
+        try:
+            destination.mkdir(parents=True, exist_ok=False)
+            return take_uid, destination
+        except FileExistsError:
+            continue
+    raise ApiError(500, "E_TAKE_ID_COLLISION", "could not allocate a take id")
+
+
+def create_generate_job(scene_uid: str, provider: str, spec: dict) -> dict:
+    job_id = new_uid("job")
+    now = utc_now()
+    inbox = project_write_path(INBOX_DIR / job_id)
+    inbox.mkdir(parents=True, exist_ok=False)
+    immutable_spec = {
+        "prompt": spec["prompt"],
+        "provider_hint": spec["provider_hint"],
+        "duration_s": spec["duration_s"],
+    }
+    input_bytes = json.dumps(
+        {"scene_uid": scene_uid, "provider": provider, "spec": immutable_spec},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    record = {
+        "job_id": job_id,
+        "kind": "generate",
+        "project": repo_relative(PROJECT),
+        "scene_uid": scene_uid,
+        "provider": provider,
+        "spec": immutable_spec,
+        "input_sha256": sha256(input_bytes).hexdigest(),
+        "state": "submitted",
+        "progress": 0,
+        "message": "waiting for courier fulfillment",
+        "attempt": 1,
+        "max_attempts": 2,
+        "parent_job_id": None,
+        "lineage_root": job_id,
+        "pid": None,
+        "start_token": None,
+        "provider_job_id": None,
+        "output_dir": repo_relative(inbox),
+        "expected_artifacts": [],
+        "candidates": [],
+        "resolved_candidate_count": 0,
+        "inbox_files": {},
+        "exit_code": None,
+        "error": None,
+        "created_at": now,
+        "started_at": now,
+        "updated_at": now,
+        "completed_at": None,
+    }
+    try:
+        write_job(record)
+    except Exception:
+        shutil.rmtree(inbox, ignore_errors=True)
+        raise
+    return record
+
+
+def attach_courier_candidate(
+    record: dict,
+    inbox_file: Path,
+    source: Path,
+    artifact: Path,
+    profile: str,
+    probe: dict,
+    digest: str,
+    file_stamp: dict,
+) -> dict:
+    """Attach one conformed courier result while job_lock is held."""
+    scene_uid = str(record["scene_uid"])
+    timeline = load_timeline()
+    scene = find_scene(timeline, scene_uid)
+    if scene is None:
+        raise ApiError(404, "E_SCENE_NOT_FOUND", "courier job scene was not found")
+    takes = scene.get("takes") if isinstance(scene.get("takes"), list) else []
+    scene["takes"] = takes
+    take = next((
+        item for item in takes
+        if isinstance(item, dict) and secrets.compare_digest(str(item.get("sha256", "")), digest)
+    ), None)
+    final_dir = None
+    if take is None:
+        take_uid, final_dir = allocate_take_dir(scene_uid)
+        source_suffix = source.suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", source_suffix):
+            source_suffix = ".bin"
+        artifact_suffix = artifact.suffix.lower()
+        final_source = final_dir / f"source{source_suffix}"
+        final_artifact = final_dir / f"asset{artifact_suffix}"
+        try:
+            os.replace(source, final_source)
+            os.replace(artifact, final_artifact)
+            take = {
+                "take_uid": take_uid,
+                "file": repo_relative(final_artifact),
+                "source_file": repo_relative(final_source),
+                "sha256": digest,
+                "created_at": utc_now(),
+                "conform_profile": profile,
+                "probe": probe,
+                "provenance": {
+                    "provider": record["provider"],
+                    "job_id": record["job_id"],
+                    "spec": dict(record["spec"]),
+                },
+            }
+            takes.append(take)
+            normalized, errors, _warnings = normalize_timeline(timeline)
+            if errors or normalized is None:
+                raise ApiError(400, "E_TIMELINE_INVALID", "courier take could not be attached", errors)
+            backup_and_write(TIMELINE, normalized, "backups", "timeline")
+            timeline = normalized
+            scene = find_scene(timeline, scene_uid)
+        except Exception:
+            shutil.rmtree(final_dir, ignore_errors=True)
+            raise
+
+    picked = bool(scene and scene.get("active_take_uid") == take["take_uid"])
+    candidates = record.setdefault("candidates", [])
+    existing_candidate = next((
+        item for item in candidates
+        if isinstance(item, dict) and secrets.compare_digest(str(item.get("sha256", "")), digest)
+    ), None)
+    if existing_candidate is None:
+        candidates.append({
+            "take_uid": take["take_uid"],
+            "file": take["file"],
+            "sha256": digest,
+            "picked": picked,
+            "inbox_file": inbox_file.name,
+            "inbox_mtime_ns": file_stamp["mtime_ns"],
+            "inbox_size": file_stamp["size"],
+        })
+    record.setdefault("inbox_files", {})[inbox_file.name] = file_stamp
+    now = utc_now()
+    unresolved = max(0, len(candidates) - int(record.get("resolved_candidate_count", 0)))
+    if unresolved:
+        record.update({
+            "state": "awaiting_pick",
+            "progress": 1,
+            "message": f"{unresolved} candidate(s) awaiting pick",
+            "completed_at": None,
+        })
+    else:
+        record.update({
+            "state": "succeeded",
+            "progress": 1,
+            "message": "fulfilled candidate is already active",
+            "completed_at": now,
+        })
+    record.update({"updated_at": now, "error": None})
+    write_job(record)
+    return record
+
+
+def poll_courier_job(record: dict) -> dict:
+    if record.get("kind") != "generate" or record.get("state") == "canceled":
+        return record
+    inbox, outside = resolve_persisted_path(ROOT, PROJECT, str(record.get("output_dir", "")))
+    if outside or inbox is None or not inbox.is_dir():
+        return record
+    for inbox_file in sorted(inbox.iterdir(), key=lambda path: path.name):
+        if inbox_file.name.startswith(".") or not inbox_file.is_file():
+            continue
+        try:
+            stat = inbox_file.stat()
+        except OSError:
+            continue
+        if time.time() - stat.st_mtime < COURIER_SETTLE_SECONDS:
+            continue
+        file_stamp = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        if record.get("inbox_files", {}).get(inbox_file.name) == file_stamp:
+            continue
+        temp_root = project_write_path(PROJECT / "work" / "tmp")
+        temp_root.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(dir=temp_root, prefix=".courier-ingest-") as folder:
+                staging = Path(folder)
+                suffix = inbox_file.suffix.lower()
+                if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+                    suffix = ".bin"
+                source = staging / f"source{suffix}"
+                shutil.copy2(inbox_file, source)
+                timeline = load_timeline()
+                scene = find_scene(timeline, str(record.get("scene_uid", "")))
+                if scene is None:
+                    raise ApiError(404, "E_SCENE_NOT_FOUND", "courier job scene was not found")
+                with conform_slots:
+                    artifact, profile, probe = conform_take(source, staging, scene, timeline)
+                digest = sha256_file(artifact)
+                with job_lock:
+                    current = read_job(str(record["job_id"]))
+                    if current is None or current.get("state") == "canceled":
+                        return current or record
+                    with timeline_lock:
+                        record = attach_courier_candidate(
+                            current, inbox_file, source, artifact, profile, probe, digest, file_stamp
+                        )
+        except (ApiError, OSError) as error:
+            with job_lock:
+                current = read_job(str(record["job_id"])) or record
+                if current.get("state") != "canceled":
+                    current.setdefault("inbox_files", {})[inbox_file.name] = file_stamp
+                    current.update({
+                        "message": f"courier file rejected: {error}",
+                        "error": {"code": getattr(error, "code", "E_COURIER_INGEST"), "message": str(error)},
+                        "updated_at": utc_now(),
+                    })
+                    write_job(current)
+                record = current
+    return record
+
+
+def poll_courier_jobs() -> list[dict]:
+    records = read_jobs()
+    for index, record in enumerate(records):
+        if record.get("kind") == "generate" and record.get("state") != "canceled":
+            records[index] = poll_courier_job(record)
+        else:
+            records[index] = reconcile_job_record(record)
+    return records
+
+
+def courier_poller() -> None:
+    while True:
+        try:
+            poll_courier_jobs()
+        except Exception:  # noqa: BLE001 - one bad drop must not stop the watcher
+            pass
+        time.sleep(COURIER_POLL_SECONDS)
+
+
+class CourierProvider:
+    """File-backed provider implementing submit(spec), poll(job), and cancel(job)."""
+
+    def __init__(self, scene_uid: str, provider: str):
+        self.scene_uid = scene_uid
+        self.provider = provider
+
+    def submit(self, spec: dict) -> dict:
+        return create_generate_job(self.scene_uid, self.provider, spec)
+
+    def poll(self, record: dict) -> dict:
+        return poll_courier_job(record)
+
+    def cancel(self, record: dict) -> dict:
+        now = utc_now()
+        record.update({
+            "state": "canceled",
+            "message": "canceled before courier fulfillment",
+            "updated_at": now,
+            "completed_at": now,
+            "error": None,
+        })
+        write_job(record)
+        return record
+
+
 def linux_proc_stat_fields(pid: int) -> list[str] | None:
     """Return /proc stat fields 3..N without being confused by spaces in comm."""
     proc_stat = Path(f"/proc/{pid}/stat")
@@ -839,6 +1114,8 @@ def pid_is_alive(pid: int) -> bool:
 
 def reconcile_job_record(record: dict) -> dict:
     """Mark one interrupted local job honestly after a server restart."""
+    if record.get("kind") == "generate":
+        return record
     if record.get("state") not in {"queued", "submitted", "running"}:
         return record
     job_id = record.get("job_id")
@@ -1185,7 +1462,23 @@ def cancel_process_job(job_id: str, supplied_token: str | None) -> dict:
         if record.get("state") == "canceled":
             return record
         if record.get("state") not in {"queued", "submitted", "running"}:
-            raise ApiError(409, "E_JOB_NOT_RUNNING", "only an active job can be canceled", {"job": record})
+            if record.get("kind") == "generate" and record.get("state") == "awaiting_pick":
+                pass
+            else:
+                raise ApiError(409, "E_JOB_NOT_RUNNING", "only an active job can be canceled", {"job": record})
+        if record.get("kind") == "generate":
+            provider = CourierProvider(str(record.get("scene_uid", "")), str(record.get("provider", "")))
+            canceled = provider.cancel(record)
+            scene_uid = str(canceled.get("scene_uid", ""))
+            with timeline_lock:
+                timeline = load_timeline()
+                scene = find_scene(timeline, scene_uid)
+                if scene and scene.get("status") == "generating":
+                    scene["status"] = "draft" if scene.get("active_take_uid") else "planned"
+                    normalized, errors, _warnings = normalize_timeline(timeline)
+                    if not errors and normalized is not None:
+                        backup_and_write(TIMELINE, normalized, "backups", "timeline")
+            return canceled
         pid = record.get("pid")
         expected_token = record.get("start_token")
         current_token = process_start_token(pid) if isinstance(pid, int) and pid_is_alive(pid) else None
@@ -1260,7 +1553,11 @@ def start_scene_job(
         if any(job["running"] for job in scene_jobs.values()):
             return None
         durable_records = reconcile_jobs()
-        if any(record.get("state") in {"queued", "submitted", "running"} for record in durable_records):
+        if any(
+            record.get("kind") != "generate"
+            and record.get("state") in {"queued", "submitted", "running"}
+            for record in durable_records
+        ):
             return None
         if any(
             record.get("state") == "unknown"
@@ -1441,10 +1738,98 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def find_scene(timeline: dict, scene_uid: str) -> dict | None:
-        return next((
-            scene for scene in timeline.get("shots", [])
-            if isinstance(scene, dict) and scene.get("scene_uid") == scene_uid
-        ), None)
+        return find_scene(timeline, scene_uid)
+
+    def handle_scene_revise(self, scene_uid: str, body: dict) -> None:
+        prompt = str(body.get("prompt", "")).strip()
+        provider_hint = str(body.get("provider_hint", "")).strip().lower()
+        try:
+            duration_s = float(body.get("duration_s"))
+        except (TypeError, ValueError):
+            self.send_json({"code": "E_GENERATE_SPEC", "error": "duration_s must be a number"}, 400)
+            return
+        if not prompt or len(prompt) > 4000:
+            self.send_json({
+                "code": "E_GENERATE_SPEC",
+                "error": "prompt must be between 1 and 4000 characters",
+            }, 400)
+            return
+        if not math.isfinite(duration_s) or duration_s <= 0 or duration_s > 600:
+            self.send_json({
+                "code": "E_GENERATE_SPEC",
+                "error": "duration_s must be greater than 0 and no more than 600",
+            }, 400)
+            return
+        if provider_hint not in {"fable", "hyperframe", "either"}:
+            self.send_json({
+                "code": "E_GENERATE_SPEC",
+                "error": "provider_hint must be fable, hyperframe, or either",
+            }, 400)
+            return
+
+        with timeline_lock:
+            if not self.require_timeline_match():
+                return
+            timeline = load_timeline()
+            scene = self.find_scene(timeline, scene_uid)
+            if scene is None:
+                self.send_json({"code": "E_SCENE_NOT_FOUND", "error": "scene was not found"}, 404)
+                return
+            provider = str(scene.get("engine", ""))
+            if provider not in {"fable", "hyperframe"}:
+                self.send_json({
+                    "code": "E_ENGINE_ACTION",
+                    "error": "generation is available only for fable or hyperframe scenes",
+                }, 400)
+                return
+            if provider_hint not in {provider, "either"}:
+                self.send_json({
+                    "code": "E_GENERATE_SPEC",
+                    "error": "provider_hint must match the selected scene engine or be either",
+                }, 400)
+                return
+            scene["status"] = "generating"
+            normalized, errors, warnings = normalize_timeline(timeline)
+            if errors or normalized is None:
+                self.send_json({
+                    "code": "E_TIMELINE_INVALID",
+                    "error": "generation job could not be attached to this timeline",
+                    "errors": errors,
+                    "warnings": warnings,
+                }, 400)
+                return
+            spec = {
+                "prompt": prompt,
+                "provider_hint": provider_hint,
+                "duration_s": round(duration_s, 3),
+            }
+            record = None
+            try:
+                record = CourierProvider(scene_uid, provider).submit(spec)
+                backup = backup_and_write(TIMELINE, normalized, "backups", "timeline")
+            except (ApiError, OSError) as error:
+                if record is not None:
+                    (JOBS_DIR / f"{record['job_id']}.json").unlink(missing_ok=True)
+                    shutil.rmtree(INBOX_DIR / record["job_id"], ignore_errors=True)
+                self.send_api_error(
+                    error if isinstance(error, ApiError)
+                    else ApiError(500, "E_GENERATE_SUBMIT", "generation job could not be submitted", str(error))
+                )
+                return
+            etag = timeline_etag()
+            saved_scene = self.find_scene(normalized, scene_uid)
+            issues = project_validation(normalized)
+        self.send_json({
+            "submitted": True,
+            "job": record,
+            "job_id": record["job_id"],
+            "scene": saved_scene,
+            "timeline": normalized,
+            "backup": backup,
+            "etag": etag,
+            "issues": issues,
+            "warnings": warnings,
+        }, 202, {"ETag": f'"{etag}"'})
 
     def handle_take_import(self, scene_uid: str) -> None:
         # Reject stale editors before they send a large body, then check the
@@ -1635,7 +2020,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"code": "E_TAKE_NOT_FOUND", "error": "take was not found"}, 404)
                 return
             scene["active_take_uid"] = take_uid
-            if scene.get("status") == "planned":
+            if scene.get("status") in {"planned", "generating"}:
                 scene["status"] = "draft"
             derive_legacy_fields(scene)
             normalized, errors, warnings = normalize_timeline(timeline)
@@ -1651,6 +2036,26 @@ class Handler(BaseHTTPRequestHandler):
             etag = timeline_etag()
             saved_scene = self.find_scene(normalized, scene_uid)
             issues = project_validation(normalized)
+        with job_lock:
+            for record in read_jobs():
+                if record.get("kind") == "generate" and any(
+                    isinstance(candidate, dict) and candidate.get("take_uid") == take_uid
+                    for candidate in record.get("candidates", [])
+                ):
+                    for candidate in record.get("candidates", []):
+                        if isinstance(candidate, dict):
+                            candidate["picked"] = candidate.get("take_uid") == take_uid
+                    now = utc_now()
+                    record.update({
+                        "state": "succeeded",
+                        "progress": 1,
+                        "message": "candidate picked and promoted",
+                        "resolved_candidate_count": len(record.get("candidates", [])),
+                        "updated_at": now,
+                        "completed_at": now,
+                        "error": None,
+                    })
+                    write_job(record)
         self.send_json({
             "promoted": True,
             "take": take,
@@ -1840,9 +2245,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scenes/jobs":
             self.send_json(scene_jobs)
         elif path == "/api/jobs":
-            self.send_json({"jobs": reconcile_jobs()})
+            self.send_json({"jobs": poll_courier_jobs()})
         elif re.fullmatch(r"/api/jobs/job_[A-Za-z0-9]{8,32}", path):
             job = reconcile_job(path.rsplit("/", 1)[-1])
+            if job and job.get("kind") == "generate":
+                job = CourierProvider(
+                    str(job.get("scene_uid", "")), str(job.get("provider", ""))
+                ).poll(job)
             self.send_json({"job": job} if job else {"error": "job was not found"}, 200 if job else 404)
         elif path.startswith("/media/take/"):
             if not self.authorize_take_media():
@@ -1876,6 +2285,16 @@ class Handler(BaseHTTPRequestHandler):
         )
         if import_match:
             self.handle_take_import(import_match.group(1))
+            return
+        revise_match = re.fullmatch(
+            r"/api/scene/(scn_[A-Za-z0-9]{8,32})/revise", path
+        )
+        if revise_match:
+            body = self.read_body()
+            if body is None:
+                self.send_json({"error": "invalid JSON body"}, 400)
+                return
+            self.handle_scene_revise(revise_match.group(1), body)
             return
         promote_match = re.fullmatch(
             r"/api/scene/(scn_[A-Za-z0-9]{8,32})/takes/(take_[A-Za-z0-9]{8,32})/promote", path
@@ -2082,6 +2501,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     reconcile_jobs()
+    threading.Thread(target=courier_poller, daemon=True).start()
     print(f"Video workbench for {PROJECT}  ->  http://localhost:{PORT}")
     print(f"Session token: {SESSION_TOKEN}")
     print(f"CLI import token: {CLI_IMPORT_TOKEN}")
