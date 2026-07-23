@@ -1371,6 +1371,7 @@ class TimelineTests(unittest.TestCase):
     def test_windows_liveness_probe_never_uses_os_kill(self):
         with (
             mock.patch.object(SERVER.os, "name", "nt"),
+            mock.patch.object(SERVER, "linux_proc_stat_fields", return_value=None),
             mock.patch.object(SERVER, "process_start_token", return_value="1234:token"),
             mock.patch.object(SERVER.os, "kill", side_effect=AssertionError("os.kill is destructive on Windows")),
         ):
