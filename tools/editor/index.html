@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>Video Workbench</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/scene-editor.css">
 <style>
   :root {
@@ -99,7 +100,7 @@
 </header>
 
 <div id="main" class="workspace cut-workspace">
-  <div id="left"><video id="vid" src="/media/proxy.mp4"></video></div>
+  <div id="left"><video id="vid" data-src="/media/proxy.mp4"></video></div>
   <div id="right">
     <div id="inspector" class="panel"><h3>Segment</h3><div id="inspBody">Click a block on the timeline.</div>
       <div class="kbd"><b>Space</b> play · <b>E</b> mode · <b>←/→</b> ±2s · <b>Shift+←/→</b> ±10s · <b>,/.</b> ±1 frame ·
@@ -127,10 +128,17 @@
 
   <main id="sceneStage">
     <div class="scene-player-shell">
-      <video id="sceneVid" src="/media/proxy.mp4" controls></video>
+      <video id="sceneVid" controls></video>
+      <video id="sceneTakePreview" class="hidden" controls muted playsinline></video>
       <img id="sceneStill" alt="Rendered scene frame" class="hidden">
       <div id="sceneEmptyPreview" class="scene-empty-preview">
         Select a timeline scene, then render its current frame.
+      </div>
+      <div id="sceneCompareControls" class="scene-compare-controls hidden">
+        <span id="sceneCompareLabel">Compare</span>
+        <button type="button" data-compare-side="a">A</button>
+        <button type="button" data-compare-side="b">B</button>
+        <button id="sceneCompareClose" type="button">Done</button>
       </div>
     </div>
     <div class="scene-stagebar">
@@ -140,6 +148,14 @@
       <span class="grow"></span>
       <button id="sceneClearPreviewBtn" disabled>Show master</button>
     </div>
+    <section id="sceneTakesDrawer" class="scene-takes-drawer" aria-label="Takes for selected scene">
+      <div class="scene-takes-head">
+        <div><strong>Takes</strong><span id="sceneTakesSummary" class="scene-muted"></span></div>
+        <span id="sceneImportState" class="scene-muted"></span>
+      </div>
+      <div id="sceneTakeStrip" class="scene-take-strip"></div>
+      <input id="sceneTakeInput" class="hidden" type="file" accept="video/*,.mov,.mkv,.webm,.m4v">
+    </section>
     <pre id="sceneJobLog" class="scene-job-log">No render job running.</pre>
   </main>
 
@@ -163,7 +179,7 @@
       &nbsp;— <span style="color:var(--dim)">live playback is approximate; rendered preview is exact</span></span>
   </div>
   <div id="timeline"><div id="tl-inner">
-    <img id="wave" src="/media/waveform.png" draggable="false">
+    <img id="wave" data-src="/media/waveform.png" draggable="false">
     <div class="ruler" id="ruler"></div>
     <div id="playhead"></div>
   </div></div>
@@ -223,8 +239,10 @@ function fromGlobal(t) {
 
 async function init() {
   const r = await fetch("/api/data"); const j = await r.json();
-  if (!r.ok) { setStatus(j.error + (j.hint ? " - " + j.hint : ""), "err"); return; }
+  if (!r.ok || j.prepared === false) { setStatus(j.error + (j.hint ? " - " + j.hint : ""), "err"); return; }
   DATA = j.cuts; MANIFEST = j.manifest; TOTAL = MANIFEST.total;
+  if (!vid.src) { vid.src = vid.dataset.src; vid.load(); }
+  if (!$("wave").src) $("wave").src = $("wave").dataset.src;
   FPS = FPS_QUERY || parseFps(j.fps) || 59.94;  // query wins, then server probe, then default
   for (const p of MANIFEST.parts) OFFSETS[p.id] = p.offset;
   events = [];
@@ -545,9 +563,11 @@ $("styleSel").onchange = rebuildPlan;
 $("saveBtn").onclick = save;
 $("renderBtn").onclick = render;
 window.addEventListener("beforeunload", e => { if (dirty) e.preventDefault(); });
-vid.addEventListener("loadedmetadata", () => { if (Math.abs(vid.duration - TOTAL) > 2) setStatus("proxy/manifest length mismatch — rebuild proxy", "err"); });
+vid.addEventListener("loadedmetadata", () => {
+  if (MANIFEST && Math.abs(vid.duration - TOTAL) > 2) setStatus("proxy/manifest length mismatch — rebuild proxy", "err");
+});
 
-init();
+if (new URLSearchParams(location.search).get("workspace") !== "scenes") init();
 </script>
 <script src="/scene-editor.js"></script>
 </body>

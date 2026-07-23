@@ -15,12 +15,18 @@
     warnings: [],
     issues: [],
     etag: "",
+    previewTakeUid: null,
+    compare: null,
+    takesOpen: true,
+    importing: false,
   };
 
   const sceneVid = $("sceneVid");
   const sceneTimeline = $("sceneTimeline");
   const sceneInner = $("sceneTimelineInner");
   const sceneStill = $("sceneStill");
+  const sceneTakePreview = $("sceneTakePreview");
+  let cutInitPromise = null;
 
   const esc = (value) => String(value == null ? "" : value)
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -32,10 +38,11 @@
     return `${String(Math.floor(value / 60)).padStart(2, "0")}:${(value % 60).toFixed(2).padStart(5, "0")}`;
   };
   const activeScene = () => S.selectedIndex == null ? null : S.timeline.shots[S.selectedIndex] || null;
+  const activeTake = (scene) => (scene && scene.takes || []).find((take) => take.take_uid === scene.active_take_uid) || null;
   const compById = (id) => S.compositions.find((item) => item.id === id);
   const groupOf = (comp) => comp.group || (comp.source ? comp.source.split("/").slice(-2, -1)[0] : "other") || "other";
 
-  function switchWorkspace(name) {
+  async function switchWorkspace(name) {
     document.body.dataset.workspace = name;
     document.querySelectorAll(".cut-workspace").forEach((node) => node.classList.toggle("hidden", name !== "cut"));
     document.querySelectorAll(".scene-workspace").forEach((node) => node.classList.toggle("hidden", name !== "scenes"));
@@ -47,6 +54,21 @@
       if (Number.isFinite(vid.currentTime)) sceneVid.currentTime = vid.currentTime;
       renderSceneTimeline();
     } else if (Number.isFinite(sceneVid.currentTime)) {
+      if (!DATA) {
+        if (!cutInitPromise) {
+          cutInitPromise = init().finally(() => {
+            if (!DATA) cutInitPromise = null;
+          });
+        }
+        try {
+          await cutInitPromise;
+        } catch (error) {
+          cutInitPromise = null;
+          setStatus(`cut workspace failed to load: ${error.message}`, "err");
+          return;
+        }
+        if (!DATA) return;
+      }
       seek(sceneVid.currentTime);
     }
   }
@@ -68,6 +90,220 @@
     return blocking;
   }
 
+  function takeMediaUrl(scene, takeUid) {
+    const token = encodeURIComponent(window.workbenchToken || "");
+    return `/media/take/${encodeURIComponent(scene.scene_uid)}/${encodeURIComponent(takeUid)}?token=${token}`;
+  }
+
+  function applyServerTimeline(data, selectedSceneUid) {
+    if (!data.timeline) return;
+    S.timeline = data.timeline;
+    S.etag = data.etag || S.etag;
+    S.issues = data.issues || S.issues;
+    S.warnings = data.warnings || [];
+    S.selectedIndex = S.timeline.shots.findIndex((scene) => scene.scene_uid === selectedSceneUid);
+    if (S.selectedIndex < 0) S.selectedIndex = null;
+    S.dirty = false;
+    $("sceneSaveBtn").disabled = true;
+    renderCatalog();
+    renderSceneTimeline();
+    renderSceneInspector();
+    applyValidation();
+  }
+
+  function showTakePreview(takeUid) {
+    const scene = activeScene();
+    const take = (scene && scene.takes || []).find((item) => item.take_uid === takeUid);
+    if (!scene || !take) return;
+    S.previewTakeUid = takeUid;
+    sceneVid.pause();
+    sceneStill.removeAttribute("src");
+    sceneStill.className = "hidden";
+    const nextUrl = takeMediaUrl(scene, takeUid);
+    if (sceneTakePreview.dataset.takeUid !== takeUid) {
+      const previousTime = Number.isFinite(sceneTakePreview.currentTime) ? sceneTakePreview.currentTime : 0;
+      sceneTakePreview.src = nextUrl;
+      sceneTakePreview.dataset.takeUid = takeUid;
+      sceneTakePreview.addEventListener("loadedmetadata", () => {
+        if (sceneTakePreview.dataset.takeUid !== takeUid) return;
+        const maxTime = Number.isFinite(sceneTakePreview.duration) ? Math.max(0, sceneTakePreview.duration - 0.01) : previousTime;
+        sceneTakePreview.currentTime = Math.min(previousTime, maxTime);
+      }, {once: true});
+      sceneTakePreview.load();
+    }
+    sceneTakePreview.classList.remove("hidden");
+    $("sceneEmptyPreview").classList.add("hidden");
+    $("sceneClearPreviewBtn").disabled = false;
+    renderTakesDrawer();
+  }
+
+  function renderCompareControls() {
+    const controls = $("sceneCompareControls");
+    if (!S.compare) {
+      controls.classList.add("hidden");
+      return;
+    }
+    controls.classList.remove("hidden");
+    $("sceneCompareLabel").textContent = `Compare ${S.compare.a.slice(-6)} / ${S.compare.b.slice(-6)}`;
+    controls.querySelectorAll("[data-compare-side]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.compareSide === S.compare.side);
+    });
+  }
+
+  function showCompareSide(side) {
+    if (!S.compare) return;
+    S.compare.side = side;
+    showTakePreview(side === "a" ? S.compare.a : S.compare.b);
+    renderCompareControls();
+  }
+
+  function startCompare(takeUid) {
+    const scene = activeScene();
+    const current = activeTake(scene);
+    if (!scene || !current || current.take_uid === takeUid) {
+      showTakePreview(takeUid);
+      setStatus(current ? "previewing active take" : "previewing candidate; promote a take to enable A/B");
+      return;
+    }
+    S.compare = {a: current.take_uid, b: takeUid, side: "b"};
+    showCompareSide("b");
+  }
+
+  function closeCompare() {
+    const scene = activeScene();
+    const current = activeTake(scene);
+    S.compare = null;
+    renderCompareControls();
+    if (current) showTakePreview(current.take_uid);
+  }
+
+  function syncScenePreview() {
+    if (S.compare) {
+      showCompareSide(S.compare.side);
+      return;
+    }
+    const current = activeTake(activeScene());
+    if (current) showTakePreview(current.take_uid);
+    else clearSceneStill();
+  }
+
+  function renderTakesDrawer() {
+    const drawer = $("sceneTakesDrawer");
+    const strip = $("sceneTakeStrip");
+    const scene = activeScene();
+    drawer.classList.toggle("open", Boolean(scene && S.takesOpen));
+    if (!scene) {
+      strip.innerHTML = "";
+      $("sceneTakesSummary").textContent = "";
+      $("sceneImportState").textContent = "";
+      return;
+    }
+    const takes = Array.isArray(scene.takes) ? scene.takes : [];
+    $("sceneTakesSummary").textContent = `${takes.length} take${takes.length === 1 ? "" : "s"}${scene.active_take_uid ? ` · active ${scene.active_take_uid.slice(-6)}` : " · none active"}`;
+    $("sceneImportState").textContent = S.importing ? "Uploading and conforming…" : "";
+    const cards = takes.map((take) => {
+      const provenance = take.provenance || {};
+      const provider = provenance.provider || scene.engine || "media";
+      const probe = take.probe || {};
+      const active = take.take_uid === scene.active_take_uid;
+      const note = provenance.note || (provenance.spec && provenance.spec.original_filename) || "Immutable take";
+      const meta = [
+        Number.isFinite(Number(probe.dur_s)) ? `${Number(probe.dur_s).toFixed(2)}s` : "",
+        probe.w && probe.h ? `${probe.w}×${probe.h}` : "",
+        take.cost_usd != null ? `$${Number(take.cost_usd).toFixed(2)}` : "",
+      ].filter(Boolean).join(" · ");
+      return `<article class="scene-take-card${active ? " active" : " candidate"}${S.previewTakeUid === take.take_uid ? " previewing" : ""}" data-take-uid="${esc(take.take_uid)}">
+        <div class="scene-take-title"><i class="scene-engine-dot ${esc(provider)}"></i><strong>${esc(take.take_uid)}</strong></div>
+        ${active ? '<span class="scene-take-badge">ACTIVE</span>' : ""}
+        <div class="scene-take-meta">${esc(meta || take.conform_profile || "take")}</div>
+        <div class="scene-take-note" title="${esc(note)}">${esc(note)}</div>
+        <div class="scene-take-actions">
+          <button type="button" data-take-action="preview">Preview</button>
+          ${!active && scene.active_take_uid ? '<button type="button" data-take-action="compare">Compare</button>' : ""}
+          ${!active ? '<button type="button" class="promote" data-take-action="promote">Promote</button>' : ""}
+        </div>
+      </article>`;
+    }).join("");
+    strip.innerHTML = `${cards}<button type="button" class="scene-take-import${S.importing ? " busy" : ""}" id="sceneTakeImportCard" ${S.importing ? "disabled" : ""}>＋<br>Import take<br><span class="scene-muted">source is preserved</span></button>`;
+    strip.querySelectorAll(".scene-take-card").forEach((card) => {
+      card.onclick = (event) => {
+        const action = event.target.closest("[data-take-action]")?.dataset.takeAction;
+        const takeUid = card.dataset.takeUid;
+        if (action === "compare") startCompare(takeUid);
+        else if (action === "promote") promoteTake(takeUid);
+        else showTakePreview(takeUid);
+      };
+    });
+    $("sceneTakeImportCard").onclick = () => {
+      if (!S.importing) $("sceneTakeInput").click();
+    };
+  }
+
+  async function importTake(file) {
+    if (!file || S.importing) return;
+    let scene = activeScene();
+    if (!scene) return;
+    if (S.dirty && !(await saveScenes())) return;
+    scene = activeScene();
+    if (!scene || !scene.scene_uid) return setStatus("save the scene before importing a take", "err");
+    const sceneUid = scene.scene_uid;
+    const form = new FormData();
+    form.append("file", file, file.name);
+    if (scene.notes) form.append("note", scene.notes);
+    form.append("class_hint", scene.type || "cutaway");
+    S.importing = true;
+    renderTakesDrawer();
+    setStatus(`importing ${file.name}…`);
+    try {
+      const response = await fetch(`/api/scene/${encodeURIComponent(sceneUid)}/takes/import`, {
+        method: "POST", headers: {"If-Match": S.etag}, body: form,
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        $("sceneJobLog").textContent = JSON.stringify(data, null, 2);
+        if (response.status === 409 && data.code === "E_ETAG_MISMATCH") {
+          return setStatus("Timeline changed during import. Reload before continuing so no work is overwritten.", "err");
+        }
+        return setStatus(data.error || "take import failed", "err");
+      }
+      applyServerTimeline(data, sceneUid);
+      showTakePreview(data.take.take_uid);
+      setStatus(data.deduped ? "identical take already exists · reused" : "take imported · source preserved · ready to promote", "ok");
+    } catch (error) {
+      setStatus(`take import failed: ${error.message}`, "err");
+    } finally {
+      S.importing = false;
+      $("sceneTakeInput").value = "";
+      renderTakesDrawer();
+    }
+  }
+
+  async function promoteTake(takeUid) {
+    let scene = activeScene();
+    if (!scene) return;
+    if (S.dirty && !(await saveScenes())) return;
+    scene = activeScene();
+    if (!scene || !scene.scene_uid) return;
+    const sceneUid = scene.scene_uid;
+    setStatus(`promoting ${takeUid.slice(-6)}…`);
+    const response = await fetch(`/api/scene/${encodeURIComponent(sceneUid)}/takes/${encodeURIComponent(takeUid)}/promote`, {
+      method: "POST", headers: {"Content-Type": "application/json", "If-Match": S.etag}, body: "{}",
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      $("sceneJobLog").textContent = JSON.stringify(data, null, 2);
+      if (response.status === 409 && data.code === "E_ETAG_MISMATCH") {
+        return setStatus("Timeline changed before promotion. Reload before continuing so no work is overwritten.", "err");
+      }
+      return setStatus(data.error || "take could not be promoted", "err");
+    }
+    S.compare = null;
+    applyServerTimeline(data, sceneUid);
+    showTakePreview(takeUid);
+    renderCompareControls();
+    setStatus("take promoted · timeline asset updated", "ok");
+  }
+
   async function initScenes() {
     wireSceneEvents();
     try {
@@ -80,6 +316,8 @@
       S.compositions = data.compositions || [];
       S.warnings = data.warnings || [];
       S.issues = data.issues || [];
+      sceneVid.src = `/media/master?token=${encodeURIComponent(window.workbenchToken || "")}`;
+      sceneVid.load();
       const maxEnd = Math.max(0, ...(S.timeline.shots || []).map((shot) => num(shot.master_out_s)));
       S.duration = Math.max(num(data.duration, 0), num(S.timeline.preview && S.timeline.preview.end_s, 0), maxEnd, 1);
       S.selectedCatalogId = S.compositions[0] ? S.compositions[0].id : null;
@@ -246,6 +484,7 @@
       wireProjectSettings();
       $("sceneFrameBtn").disabled = true;
       $("sceneRenderBtn").disabled = true;
+      renderTakesDrawer();
       return;
     }
     const engine = shot.engine || "remotion";
@@ -335,6 +574,7 @@
     $("sceneFrameBtn").disabled = engine !== "remotion";
     $("sceneRenderBtn").disabled = engine !== "remotion";
     updateSceneFrameLabel();
+    renderTakesDrawer();
   }
 
   function duplicateScene() {
@@ -343,16 +583,15 @@
     const duration = num(shot.master_out_s) - num(shot.master_in_s);
     const copy = JSON.parse(JSON.stringify(shot));
     delete copy.scene_uid;
-    if (copy.engine !== "remotion") {
-      copy.takes = [];
-      copy.active_take_uid = null;
-      delete copy.asset;
-    }
+    copy.takes = [];
+    copy.active_take_uid = null;
+    delete copy.asset;
     copy.master_in_s = round3(num(shot.master_out_s));
     copy.master_out_s = round3(copy.master_in_s + duration);
     copy.status = copy.status === "approved" ? "draft" : copy.status;
     S.timeline.shots.splice(S.selectedIndex + 1, 0, copy);
     S.selectedIndex += 1;
+    clearSceneStill();
     markSceneDirty(`duplicated ${shot.id}`, true);
   }
 
@@ -368,6 +607,14 @@
 
   async function saveScenes() {
     if (!S.timeline) return false;
+    const selected = activeScene();
+    const selection = selected ? {
+      sceneUid: selected.scene_uid,
+      engine: selected.engine,
+      id: selected.id,
+      start: num(selected.master_in_s),
+      end: num(selected.master_out_s),
+    } : null;
     setStatus("validating scene timeline...");
     const response = await fetch("/api/scenes/save", {
       method: "POST", headers: {"Content-Type": "application/json", "If-Match": S.etag},
@@ -376,7 +623,6 @@
     const data = await response.json();
     if (!response.ok) {
       if (response.status === 409 && data.code === "E_ETAG_MISMATCH") {
-        S.etag = data.current_etag || S.etag;
         setStatus("Timeline changed in another session. Reload before saving so no work is overwritten.", "err");
         $("sceneJobLog").textContent = JSON.stringify(data, null, 2);
         return false;
@@ -387,6 +633,14 @@
       return false;
     }
     S.timeline = data.timeline;
+    if (selection) {
+      S.selectedIndex = S.timeline.shots.findIndex((scene) => (
+        (selection.sceneUid && scene.scene_uid === selection.sceneUid)
+        || (!selection.sceneUid && scene.engine === selection.engine && scene.id === selection.id
+          && num(scene.master_in_s) === selection.start && num(scene.master_out_s) === selection.end)
+      ));
+      if (S.selectedIndex < 0) S.selectedIndex = null;
+    }
     S.etag = data.etag || response.headers.get("ETag")?.replaceAll('"', "") || S.etag;
     S.issues = data.issues || [];
     S.dirty = false;
@@ -394,6 +648,7 @@
     setStatus(`scene timeline saved${data.backup ? " · backup created" : ""}`, "ok");
     if (data.warnings && data.warnings.length) $("sceneJobLog").textContent = data.warnings.join("\n");
     renderSceneTimeline();
+    renderSceneInspector();
     applyValidation();
     return true;
   }
@@ -478,10 +733,19 @@
   }
 
   function clearSceneStill() {
+    S.previewTakeUid = null;
+    S.compare = null;
+    sceneTakePreview.pause();
+    sceneTakePreview.removeAttribute("src");
+    sceneTakePreview.removeAttribute("data-take-uid");
+    sceneTakePreview.load();
+    sceneTakePreview.className = "hidden";
     sceneStill.removeAttribute("src");
     sceneStill.className = "hidden";
     $("sceneEmptyPreview").classList.remove("hidden");
     $("sceneClearPreviewBtn").disabled = true;
+    renderCompareControls();
+    renderTakesDrawer();
   }
 
   function updateScenePlayhead() {
@@ -506,6 +770,11 @@
     $("sceneBakeBtn").onclick = bakeScenePreview;
     $("sceneFrameBtn").onclick = renderCurrentFrame;
     $("sceneClearPreviewBtn").onclick = clearSceneStill;
+    $("sceneTakeInput").onchange = (event) => importTake(event.target.files && event.target.files[0]);
+    $("sceneCompareControls").querySelectorAll("[data-compare-side]").forEach((button) => {
+      button.onclick = () => showCompareSide(button.dataset.compareSide);
+    });
+    $("sceneCompareClose").onclick = closeCompare;
     $("scenePlayBtn").onclick = () => sceneVid.paused ? sceneVid.play() : sceneVid.pause();
     $("sceneZoom").oninput = (event) => {
       const center = num(sceneVid.currentTime);
@@ -529,6 +798,7 @@
         clearSceneStill();
         renderSceneTimeline();
         renderSceneInspector();
+        syncScenePreview();
         event.preventDefault();
         return;
       }
@@ -568,6 +838,10 @@
       else if (event.key === ",") sceneVid.currentTime = Math.max(0, sceneVid.currentTime - 1 / 60);
       else if (event.key === ".") sceneVid.currentTime = Math.min(S.duration, sceneVid.currentTime + 1 / 60);
       else if (event.key.toLowerCase() === "a") addSceneAtPlayhead();
+      else if (event.key.toLowerCase() === "v" && activeScene()) {
+        S.takesOpen = !S.takesOpen;
+        renderTakesDrawer();
+      }
     });
 
     window.addEventListener("beforeunload", (event) => { if (S.dirty) event.preventDefault(); });

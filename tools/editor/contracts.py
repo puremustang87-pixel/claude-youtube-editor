@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import re
 import threading
@@ -26,6 +27,7 @@ _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _SHA256_CACHE_MAX = 256
 _SHA256_CACHE: dict[tuple[str, int, int], str] = {}
 _SHA256_CACHE_LOCK = threading.Lock()
+_MIGRATION_CREATED_AT = "1970-01-01T00:00:00+00:00"
 
 
 def utc_now() -> str:
@@ -35,6 +37,16 @@ def utc_now() -> str:
 def new_uid(prefix: str) -> str:
     """Return a sortable ULID-shaped identifier with the requested prefix."""
     value = ((time.time_ns() // 1_000_000) << 80) | int.from_bytes(os.urandom(10), "big")
+    chars = []
+    for _ in range(26):
+        chars.append(_CROCKFORD[value & 31])
+        value >>= 5
+    return f"{prefix}_{''.join(reversed(chars))}"
+
+
+def migrated_uid(prefix: str, seed: str) -> str:
+    """Return a stable ULID-shaped id until a lazy migration is persisted."""
+    value = int.from_bytes(hashlib.sha256(seed.encode("utf-8")).digest()[:16], "big")
     chars = []
     for _ in range(26):
         chars.append(_CROCKFORD[value & 31])
@@ -115,10 +127,10 @@ def resolve_persisted_path(root: Path, project: Path, value: object) -> tuple[Pa
     return resolved, False
 
 
-def _legacy_take(asset: str, root: Path, project: Path, now: str) -> dict | None:
+def _legacy_take(asset: str, root: Path, project: Path, now: str, take_uid: str) -> dict | None:
     path, outside = resolve_persisted_path(root, project, asset)
     take = {
-        "take_uid": new_uid("take"),
+        "take_uid": take_uid,
         "file": asset.replace("\\", "/"),
         "created_at": now,
         "conform_profile": "original",
@@ -132,11 +144,11 @@ def _legacy_take(asset: str, root: Path, project: Path, now: str) -> dict | None
     return take
 
 
-def _version_to_take(version: dict, root: Path, project: Path, now: str) -> dict:
+def _version_to_take(version: dict, root: Path, project: Path, now: str, uid_seed: str) -> dict:
     take = copy.deepcopy(version)
     take_uid = str(take.pop("vid", "") or take.get("take_uid", ""))
     if not TAKE_UID_RE.fullmatch(take_uid):
-        take_uid = new_uid("take")
+        take_uid = migrated_uid("take", uid_seed)
     take["take_uid"] = take_uid
     if "file" not in take:
         take["file"] = str(take.pop("asset", "") or take.pop("path", ""))
@@ -156,10 +168,17 @@ def _version_to_take(version: dict, root: Path, project: Path, now: str) -> dict
     return take
 
 
-def migrate_scene(raw: dict, catalog_ids: set[str], root: Path, project: Path) -> dict:
+def migrate_scene(
+    raw: dict,
+    catalog_ids: set[str],
+    root: Path,
+    project: Path,
+    uid_seed: str | None = None,
+) -> dict:
     """Lazily upgrade one legacy placement to the v2.1 shape."""
     scene = copy.deepcopy(raw)
-    now = utc_now()
+    now = _MIGRATION_CREATED_AT
+    stable_seed = uid_seed or json.dumps(raw, sort_keys=True, separators=(",", ":"), default=str)
     legacy_id = str(scene.get("id", "")).strip()
     legacy_asset = str(scene.get("asset", "")).strip()
 
@@ -170,7 +189,7 @@ def migrate_scene(raw: dict, catalog_ids: set[str], root: Path, project: Path) -
 
     scene_uid = str(scene.get("scene_uid", ""))
     if not SCENE_UID_RE.fullmatch(scene_uid):
-        scene_uid = new_uid("scn")
+        scene_uid = migrated_uid("scn", stable_seed)
     scene["scene_uid"] = scene_uid
 
     if engine == "remotion":
@@ -182,9 +201,19 @@ def migrate_scene(raw: dict, catalog_ids: set[str], root: Path, project: Path) -
     if not isinstance(takes, list):
         versions = scene.pop("versions", None)
         if isinstance(versions, list):
-            takes = [_version_to_take(item, root, project, now) for item in versions if isinstance(item, dict)]
+            takes = [
+                _version_to_take(item, root, project, now, f"{scene_uid}:version:{index}")
+                for index, item in enumerate(versions)
+                if isinstance(item, dict)
+            ]
         else:
-            migrated = _legacy_take(legacy_asset, root, project, now) if legacy_asset else None
+            migrated = _legacy_take(
+                legacy_asset,
+                root,
+                project,
+                now,
+                migrated_uid("take", f"{scene_uid}:legacy:{legacy_asset}"),
+            ) if legacy_asset else None
             takes = [migrated] if migrated else []
     else:
         takes = [copy.deepcopy(item) for item in takes if isinstance(item, dict)]
@@ -235,8 +264,14 @@ def migrate_timeline(payload: dict, catalog_ids: set[str], root: Path, project: 
     shots = timeline.get("shots")
     if isinstance(shots, list):
         timeline["shots"] = [
-            migrate_scene(scene, catalog_ids, root, project)
-            for scene in shots
+            migrate_scene(
+                scene,
+                catalog_ids,
+                root,
+                project,
+                f"scene:{index}:" + json.dumps(scene, sort_keys=True, separators=(",", ":"), default=str),
+            )
+            for index, scene in enumerate(shots)
             if isinstance(scene, dict)
         ]
     return timeline

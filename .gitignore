@@ -28,6 +28,9 @@ videos/*/reference/
 # heavy / regenerable per-video artifacts (rebuilt by the pipeline)
 videos/*/work/audio/
 videos/*/work/render/
+videos/*/work/generated/
+videos/*/work/inbox/
+videos/*/work/tmp/
 videos/*/work/editor/*.mp4
 videos/*/work/editor/*.png
 videos/*/output/
