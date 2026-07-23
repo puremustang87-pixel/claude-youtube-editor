@@ -2,7 +2,7 @@
 
 **The one page that says what's real.** Updated with every merge. If it isn't reflected here and merged to `main`, it isn't real yet.
 
-_Last updated: 2026-07-23 02:15 UTC+1 · maintained by whoever merges_
+_Last updated: 2026-07-23 04:35 UTC+1 · maintained by whoever merges_
 
 ## How this repo works (the 10-second version)
 
@@ -18,18 +18,19 @@ Nothing reaches `main` without an owner merge. Codex builds on `codex/*` branche
 
 - ✅ **Docs bridge** (`1d17a67`) — contracts v2.1, UI redesign packet, next-level pipeline, reviews. See `docs/README-BRIDGE.md`.
 - ✅ **Control Kit** (`d778c34`, `e170d66`) — STATUS.md, PR template, CI on every push.
-- ✅ **PR #1 — engine foundation slice** — merged. Identity split, migration, immutable takes, etag+atomic saves, durable jobs, validator, security.
+- ✅ **PR #1 — engine foundation slice** — merged.
+- ✅ **PR #2 — take ingestion + Takes drawer** — merged. 23/23 tests, multipart import, conform profiles, promote.
 
 ## In review (open PRs)
 
-- ✅ **PR #2 — take ingestion + Takes drawer** · branch `codex/take-ingest-drawer` · `92ddc8b` — **CLEARED TO MERGE (owner's click)**
-  - Fable executed audit: 23/23 tests pass (FFmpeg conform/alpha/VFR genuinely ran), independent traversal probe rejected all 4 vectors, concurrency verified (conform runs outside the lock).
-  - Multipart parsing safe by construction · ProRes-4444 overlays + H.264 cutaways with post-conform re-probe · dedup + canonical namespace + atomic promote. **Zero bugs found.**
-  - Non-blocking notes for later: cuts.json save lock (still deferred); move conform to the job queue when providers land.
+- ✅ **PR #3 — durable range bake + job progress** · `codex/range-bake-jobs` · `e1458b6` — **CLEARED TO MERGE (owner's click)**
+  - Executed audit: 36/37 pass on Linux (real ffmpeg range bake w/ A/V sync, immutable per-job artifacts, SIGTERM-ignoring-child cancel, restart admission); offset fix + atomic publish read-verified.
+  - Codex's Windows discovery: os.kill(pid,0) is destructive on Windows — replaced with verified start-token probe.
+  - F1 (SEV-3, test-only): the Windows-liveness test errors on Python 3.10/3.11 (pathlib dispatch via patched os.name); passes on CI's 3.12. **Required: 3-line test fix as first commit of the PR #4 branch.**
 
 ## Next up (not started)
 
-1. **Merge PR #2** (owner), then Codex starts: provider/courier adapters (Fable/Hyperframe) on the job+take contract.
+1. **Merge PR #3** (owner), then Codex starts PR #4: courier inbox + generate jobs (docs/V1-PLAN.md) — first commit = the F1 test fix.
 2. Hyperframe generation + richer scene editing (typed Remotion props).
 3. Script-driven pipeline N1 (ingest) — see `docs/next-level/NEXT-LEVEL.md`.
 4. Sweep the deferred `cuts.json` save lock when the Cut workspace is next touched.
