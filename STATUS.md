@@ -2,7 +2,7 @@
 
 **The one page that says what's real.** Updated with every merge. If it isn't reflected here and merged to `main`, it isn't real yet.
 
-_Last updated: 2026-07-23 05:00 UTC+1 · maintained by whoever merges_
+_Last updated: 2026-07-23 05:30 UTC+1 · V1.0 code complete pending final merge_
 
 ## How this repo works (the 10-second version)
 
@@ -20,18 +20,21 @@ Nothing reaches `main` without an owner merge. Codex builds on `codex/*` branche
 - ✅ **Control Kit** (`d778c34`, `e170d66`) — STATUS.md, PR template, CI on every push.
 - ✅ **PR #1 — engine foundation slice** — merged.
 - ✅ **PR #2 — take ingestion + Takes drawer** — merged. 23/23 tests, multipart import, conform profiles, promote.
-- ✅ **PR #3 — durable range bake + job progress** — merged (`526aaf6`). Range bake, immutable per-job artifacts, verified cancel, Windows os.kill liveness fix.
+- ✅ **PR #3 — durable range bake + job progress** — merged (`526aaf6`).
+- ✅ **PR #4 — courier inbox + generate jobs** — merged. The "scene needs something → prompt → clip becomes a take" loop.
 
 ## In review (open PRs)
 
-- ✅ **PR #4 — courier inbox + generate jobs** · `codex/courier-generate-jobs` · `d9b37ca` — **CLEARED TO MERGE** (owner says "merge PR #4" to Codex)
-  - Executed audit on the environment that surfaced F1: 38/38 pass incl. the 20-assertion courier lifecycle test; F1 fix verified (previously-erroring test now green on the same box).
-  - Settle window, stamp-dedupe, cancel-race re-check after conform, poison-file quarantine, provider interface per contract. Zero blocking findings.
-  - v1.1 notes: poller silent-exception surfacing; split the mega lifecycle test.
+- ✅ **PR #5 — VO project bootstrap** · `codex/vo-project-bootstrap` · `a21ec20` — **CLEARED TO MERGE (owner says "merge PR #5") — completes V1.0**
+  - Fable ran the owner's literal first command: scaffold ✓, VO-synth master at exact A/V parity ✓, assets classified+cataloged ✓, bake --check issues:[] ✓. 41/41 tests.
+  - Only un-executed path: live AssemblyAI call (owner's key; ruler ticks covered by mocked test).
 
 ## Next up (not started)
 
-1. **Owner: tell Codex "merge PR #4"**, then Codex starts PR #5: VO project bootstrap (docs/V1-PLAN.md) — the final slice before first-video editing.
+1. **Owner: "merge PR #5" → V1.0 COMPLETE.** Then on the machine: `git pull` and
+   `./workbench --new-project video-1 --vo vo.wav --assets ./my-assets` — first real edit.
+2. PR #6 (reserved): first-video hardening + deferred nits (cuts.json save lock, courier poller logging).
+3. v1.1 backlog: docs/next-level/NEXT-LEVEL.md (auto-planning, editing brain, HyperFrames adapter, typed props).
 2. Hyperframe generation + richer scene editing (typed Remotion props).
 3. Script-driven pipeline N1 (ingest) — see `docs/next-level/NEXT-LEVEL.md`.
 4. Sweep the deferred `cuts.json` save lock when the Cut workspace is next touched.
