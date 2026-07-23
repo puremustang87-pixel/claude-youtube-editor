@@ -18,6 +18,28 @@
 .workspace-tabs button { border: 0; padding: 4px 14px; background: transparent; }
 .workspace-tabs button.active { background: #39404d; color: #fff; }
 
+.scene-job-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 250px;
+  padding: 3px 7px 3px 9px;
+  border: 1px solid #3b4350;
+  border-radius: 999px;
+  background: #181b21;
+  color: #b9c1cf;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.scene-job-chip #sceneJobLabel { overflow: hidden; text-overflow: ellipsis; }
+.scene-job-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: #667083; }
+.scene-job-chip.running .scene-job-dot { background: #7772ef; animation: scene-job-pulse 1.2s ease-in-out infinite; }
+.scene-job-chip.succeeded .scene-job-dot { background: #4dca8a; }
+.scene-job-chip.failed .scene-job-dot,
+.scene-job-chip.canceled .scene-job-dot { background: #e06666; }
+.scene-job-chip button { padding: 1px 6px; border-radius: 999px; font-size: 9px; }
+@keyframes scene-job-pulse { 50% { opacity: .35; } }
+
 #sceneWorkspace {
   flex: 1;
   min-height: 0;
@@ -285,6 +307,7 @@
   overflow-wrap: anywhere;
 }
 .scene-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+.scene-actions #sceneRangeBake { flex-basis: 100%; }
 .scene-actions .danger { color: #ff9b9b; border-color: #6c3636; }
 .scene-warning {
   margin: 8px 0;

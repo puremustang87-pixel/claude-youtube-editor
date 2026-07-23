@@ -4,6 +4,7 @@ import concurrent.futures
 import importlib.util
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,11 @@ finally:
     sys.argv = ORIGINAL_ARGV
 
 CONTRACTS = sys.modules["contracts"]
+BAKE_PATH = SERVER.ROOT / "tools" / "bake.py"
+BAKE_SPEC = importlib.util.spec_from_file_location("video_workbench_bake", BAKE_PATH)
+BAKE = importlib.util.module_from_spec(BAKE_SPEC)
+assert BAKE_SPEC and BAKE_SPEC.loader
+BAKE_SPEC.loader.exec_module(BAKE)
 TEST_CATALOG = [
     {"id": "BrandProof", "durationInFrames": 300, "fps": 60, "width": 1920, "height": 1080},
     {"id": "BigStatement", "durationInFrames": 300, "fps": 60, "width": 1920, "height": 1080},
@@ -433,7 +439,7 @@ class TimelineTests(unittest.TestCase):
             root = Path(folder)
             project = root / "videos" / "project-snapshot"
             timeline_path = project / "work" / "timeline.json"
-            timeline_path.parent.mkdir(parents=True)
+            timeline_path.parent.mkdir(parents=True, exist_ok=True)
             first = payload()
             first["preview"]["end_s"] = 10
             second = payload()
@@ -854,6 +860,521 @@ class TimelineTests(unittest.TestCase):
                 with self.assertRaises(SERVER.ApiError) as escaped:
                     SERVER.project_write_path(link / "upload.mp4")
             self.assertEqual(escaped.exception.code, "E_ASSET_OUTSIDE_PROJECT")
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe required")
+    def test_range_bake_duration_and_audio_video_sync(self):
+        videos = SERVER.ROOT / "videos"
+        videos.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="range-bake-test-", dir=videos) as folder:
+            project = Path(folder)
+            master = project / "master.mp4"
+            created = subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
+                "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000",
+                "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", str(master),
+            ], capture_output=True, text=True, check=False)
+            self.assertEqual(created.returncode, 0, created.stderr)
+
+            cut_scene_uid = "scn_cutaway01"
+            cut_take_uid = "take_cutaway01"
+            cut_asset = project / "work" / "generated" / cut_scene_uid / cut_take_uid / "asset.mp4"
+            cut_asset.parent.mkdir(parents=True)
+            shutil.copy2(master, cut_asset)
+
+            overlay_scene_uid = "scn_overlay001"
+            overlay_take_uid = "take_overlay001"
+            overlay_asset = project / "work" / "generated" / overlay_scene_uid / overlay_take_uid / "asset.mov"
+            overlay_asset.parent.mkdir(parents=True)
+            overlay_created = subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                "-f", "lavfi", "-i", "color=c=red@0.35:size=320x180:rate=30",
+                "-t", "6", "-vf", "format=argb", "-c:v", "qtrle", str(overlay_asset),
+            ], capture_output=True, text=True, check=False)
+            self.assertEqual(overlay_created.returncode, 0, overlay_created.stderr)
+
+            def scene(scene_uid, take_uid, asset, scene_type, profile, alpha):
+                return {
+                    "scene_uid": scene_uid, "engine": "media", "type": scene_type,
+                    "master_in_s": 0, "master_out_s": 6, "enabled": True,
+                    "status": "draft", "fit": "hold", "z": 0,
+                    "transition_in": {"kind": "cut"}, "active_take_uid": take_uid,
+                    "takes": [{
+                        "take_uid": take_uid, "file": SERVER.repo_relative(asset),
+                        "sha256": "0" * 64, "created_at": "2026-01-01T00:00:00Z",
+                        "conform_profile": profile,
+                        "probe": {"w": 320, "h": 180, "fps": "30/1", "dur_s": 6, "alpha": alpha},
+                        "provenance": {"provider": "media"},
+                    }],
+                }
+
+            timeline = payload()
+            timeline["master"] = SERVER.repo_relative(master)
+            timeline["shots"] = [scene(
+                cut_scene_uid, cut_take_uid, cut_asset, "cutaway", "cutaway_h264", False,
+            )]
+            timeline["preview"].update({
+                "end_s": 6,
+                "out": SERVER.repo_relative(project / "work" / "preview" / "full.mp4"),
+                "width": 320,
+                "height": 180,
+                "fps": 30,
+            })
+            timeline_path = project / "work" / "timeline.json"
+            timeline_path.parent.mkdir(parents=True, exist_ok=True)
+            timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
+
+            baked = subprocess.run([
+                sys.executable, str(SERVER.ROOT / "tools" / "bake.py"), str(timeline_path),
+                "--from", "1", "--end", "4",
+            ], cwd=SERVER.ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(baked.returncode, 0, baked.stdout + baked.stderr)
+            self.assertIn("PROGRESS 0.980 verified; publishing artifact", baked.stdout)
+            self.assertIn("cutaway:scn_cutaway01 @+1.00s", baked.stdout)
+            output = project / "work" / "preview" / "range-1-4.mp4"
+            self.assertTrue(output.is_file())
+
+            timeline["shots"] = [scene(
+                overlay_scene_uid, overlay_take_uid, overlay_asset, "overlay", "overlay_alpha", True,
+            )]
+            timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
+            overlay_baked = subprocess.run([
+                sys.executable, str(SERVER.ROOT / "tools" / "bake.py"), str(timeline_path),
+                "--from", "1", "--end", "4",
+            ], cwd=SERVER.ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(overlay_baked.returncode, 0, overlay_baked.stdout + overlay_baked.stderr)
+            self.assertIn("master+overlay:scn_overlay001 @+1.00s", overlay_baked.stdout)
+
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,duration",
+                "-of", "json", str(output),
+            ], capture_output=True, text=True, check=True)
+            report = json.loads(probe.stdout)
+            self.assertAlmostEqual(float(report["format"]["duration"]), 3.0, delta=0.1)
+            durations = {
+                stream["codec_type"]: float(stream["duration"])
+                for stream in report["streams"] if stream.get("duration")
+            }
+            self.assertIn("video", durations)
+            self.assertIn("audio", durations)
+            self.assertLessEqual(abs(durations["video"] - durations["audio"]), 0.05)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group assertion runs in WSL and CI")
+    def test_job_cancel_kills_the_process_group(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-cancel-") as folder:
+            project = Path(folder)
+            jobs_dir = project / "work" / "jobs"
+            ready = project / "child-ready"
+            terminated = project / "child-terminated"
+            child_code = (
+                "import pathlib,signal,sys,time;"
+                f"ready=pathlib.Path({str(ready)!r});done=pathlib.Path({str(terminated)!r});"
+                "signal.signal(signal.SIGTERM,lambda *_:(done.write_text('terminated'),sys.exit(0)));"
+                "ready.write_text('ready');time.sleep(60)"
+            )
+            parent_code = (
+                "import os,pathlib,subprocess,sys,time;"
+                f"scratch_root=pathlib.Path({str(project / 'work' / 'preview')!r});"
+                "scratch=(scratch_root/f'_bake_tmp_{os.getpid()}');scratch.mkdir(parents=True,exist_ok=True);"
+                f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                f"ready=pathlib.Path({str(ready)!r});"
+                "deadline=time.time()+5;"
+                "\nwhile not ready.exists() and time.time()<deadline: time.sleep(.01)"
+                "\nprint(f'CHILD_PID={child.pid}',flush=True);time.sleep(60)"
+            )
+            local_jobs = {
+                "still": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "render": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "bake": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+            }
+            tracked_processes = {}
+            with (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+                mock.patch.object(SERVER, "scene_jobs", local_jobs),
+                mock.patch.object(SERVER, "active_processes", tracked_processes),
+            ):
+                job_id = SERVER.start_scene_job(
+                    "bake", [sys.executable, "-c", parent_code], project,
+                    output="work/preview/cancel-test.mp4",
+                )
+                self.assertIsNotNone(job_id)
+                deadline = time.time() + 8
+                record = None
+                while time.time() < deadline:
+                    record = SERVER.read_job(job_id)
+                    if record and record.get("state") == "running" and "CHILD_PID=" in local_jobs["bake"]["log"]:
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(record)
+                self.assertEqual(record["state"], "running")
+                parent_pid = record["pid"]
+                canceled = SERVER.cancel_process_job(job_id, record["updated_at"])
+                self.assertEqual(canceled["state"], "canceled")
+                deadline = time.time() + 4
+                while time.time() < deadline and not terminated.exists():
+                    time.sleep(0.02)
+                self.assertTrue(terminated.exists(), "child never received the process-group termination")
+                deadline = time.time() + 4
+                while time.time() < deadline and SERVER.pid_is_alive(parent_pid):
+                    time.sleep(0.02)
+                self.assertFalse(SERVER.pid_is_alive(parent_pid))
+                deadline = time.time() + 4
+                while time.time() < deadline and local_jobs["bake"]["running"]:
+                    time.sleep(0.02)
+                self.assertFalse(local_jobs["bake"]["running"])
+                self.assertEqual(list((project / "work" / "preview").glob("_bake_tmp_*")), [])
+
+    def test_process_job_persists_structured_progress(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-progress-") as folder:
+            project = Path(folder)
+            jobs_dir = project / "work" / "jobs"
+            local_jobs = {
+                "still": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "render": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "bake": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+            }
+            code = "import time;print('PROGRESS 0.420 segment 2/5',flush=True);time.sleep(.4)"
+            with (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+                mock.patch.object(SERVER, "scene_jobs", local_jobs),
+                mock.patch.object(SERVER, "active_processes", {}),
+            ):
+                job_id = SERVER.start_scene_job("render", [sys.executable, "-c", code], project)
+                deadline = time.time() + 5
+                observed = None
+                while time.time() < deadline:
+                    observed = SERVER.read_job(job_id)
+                    if observed and observed.get("state") == "running" and observed.get("progress", 0) >= 0.42:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(observed)
+                self.assertAlmostEqual(observed["progress"], 0.42)
+                self.assertEqual(observed["message"], "segment 2/5")
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    observed = SERVER.read_job(job_id)
+                    if observed and observed.get("state") == "succeeded":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(observed["state"], "succeeded")
+                self.assertEqual(observed["progress"], 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process cleanup assertion runs in WSL and CI")
+    def test_progress_persistence_failure_terminates_the_worker(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-progress-fail-") as folder:
+            project = Path(folder)
+            jobs_dir = project / "work" / "jobs"
+            local_jobs = {
+                "still": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "render": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "bake": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+            }
+            code = "import time;print('PROGRESS 0.5 halfway',flush=True);time.sleep(60)"
+            with (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+                mock.patch.object(SERVER, "scene_jobs", local_jobs),
+                mock.patch.object(SERVER, "active_processes", {}),
+                mock.patch.object(SERVER, "update_job_progress", side_effect=OSError("disk full")),
+            ):
+                job_id = SERVER.start_scene_job("render", [sys.executable, "-c", code], project)
+                deadline = time.time() + 8
+                record = None
+                while time.time() < deadline:
+                    record = SERVER.read_job(job_id)
+                    if record and record.get("state") in {"failed", "unknown"}:
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(record)
+                self.assertEqual(record["state"], "failed")
+                self.assertFalse(SERVER.pid_is_alive(record["pid"]))
+
+    def test_range_bake_api_requires_etag_and_starts_a_snapshot_job(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-range-api-") as folder:
+            project = Path(folder)
+            timeline_path = project / "work" / "timeline.json"
+            timeline_path.parent.mkdir(parents=True)
+            timeline = payload()
+            timeline["shots"] = []
+            timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
+            patches = (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                mock.patch.object(SERVER, "TIMELINE", timeline_path),
+                mock.patch.object(SERVER, "JOBS_DIR", project / "work" / "jobs"),
+            )
+            for patcher in patches:
+                patcher.start()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), SERVER.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                request_body = json.dumps({"from_s": 4, "to_s": 8}).encode("utf-8")
+                missing = urllib.request.Request(
+                    base + "/api/bake/range", data=request_body, method="POST",
+                    headers={"Content-Type": "application/json", "X-Workbench-Token": SERVER.SESSION_TOKEN},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(missing, timeout=5)
+                self.assertEqual(raised.exception.code, 428)
+                raised.exception.close()
+
+                etag = SERVER.timeline_etag()
+                with mock.patch.object(SERVER, "start_scene_job", return_value="job_ABCDEFGH") as starter:
+                    request = urllib.request.Request(
+                        base + "/api/bake/range", data=request_body, method="POST",
+                        headers={
+                            "Content-Type": "application/json", "If-Match": etag,
+                            "X-Workbench-Token": SERVER.SESSION_TOKEN,
+                        },
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        started = json.load(response)
+                        self.assertEqual(response.status, 202)
+                self.assertEqual(started["job_id"], "job_ABCDEFGH")
+                args, kwargs = starter.call_args
+                self.assertEqual(args[0], "bake")
+                self.assertIn("--from", args[1])
+                self.assertIn("--end", args[1])
+                self.assertEqual(kwargs["range"], {"from_s": 4.0, "to_s": 8.0})
+                self.assertEqual(kwargs["timeline_document"]["preview"]["end_s"], 20)
+            finally:
+                server.shutdown()
+                server.server_close()
+                for patcher in reversed(patches):
+                    patcher.stop()
+
+    def test_bake_jobs_keep_immutable_per_job_artifacts(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-artifacts-") as folder:
+            project = Path(folder)
+            jobs_dir = project / "work" / "jobs"
+            published = project / "work" / "preview" / "range-1-2.mp4"
+            published.parent.mkdir(parents=True)
+            with (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+            ):
+                published.write_bytes(b"first render")
+                first = SERVER.create_job_record(
+                    "bake", ["bake"], project, {"output": "work/preview/range-1-2.mp4"},
+                    job_id="job_ARTIFACT01",
+                )
+                first_artifact = SERVER.capture_job_artifact(first["job_id"], "work/preview/range-1-2.mp4")
+
+                published.write_bytes(b"second render")
+                second = SERVER.create_job_record(
+                    "bake", ["bake"], project, {"output": "work/preview/range-1-2.mp4"},
+                    job_id="job_ARTIFACT02",
+                )
+                second_artifact = SERVER.capture_job_artifact(second["job_id"], "work/preview/range-1-2.mp4")
+
+                self.assertNotEqual(first["output_dir"], second["output_dir"])
+                self.assertNotEqual(first["expected_artifacts"], second["expected_artifacts"])
+                self.assertEqual(first_artifact.read_bytes(), b"first render")
+                self.assertEqual(second_artifact.read_bytes(), b"second render")
+
+    def test_live_durable_worker_blocks_a_second_job_after_restart(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-live-worker-") as folder:
+            project = Path(folder)
+            jobs_dir = project / "work" / "jobs"
+            local_jobs = {
+                "still": {"running": False, "job_id": None},
+                "render": {"running": False, "job_id": None},
+                "bake": {"running": False, "job_id": None},
+            }
+            with (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+                mock.patch.object(SERVER, "scene_jobs", local_jobs),
+                mock.patch.object(SERVER, "active_processes", {}),
+            ):
+                record = SERVER.create_job_record(
+                    "render", ["worker"], project, {}, job_id="job_LIVEWORK01",
+                )
+                record.update({
+                    "state": "running", "pid": os.getpid(),
+                    "start_token": SERVER.process_start_token(os.getpid()),
+                })
+                SERVER.write_job(record)
+                self.assertIsNone(SERVER.start_scene_job("render", [sys.executable, "-c", "pass"], project))
+                self.assertEqual(SERVER.read_job(record["job_id"])["state"], "running")
+
+    def test_cancel_failure_never_reports_canceled(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-cancel-fail-") as folder:
+            project = Path(folder)
+            jobs_dir = project / "work" / "jobs"
+            group_options = (
+                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                if os.name == "nt" else {"start_new_session": True}
+            )
+            proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], **group_options)
+            try:
+                with (
+                    mock.patch.object(SERVER, "PROJECT", project),
+                    mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                    mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+                    mock.patch.object(SERVER, "terminate_process_group", return_value=False),
+                ):
+                    record = SERVER.create_job_record(
+                        "render", ["worker"], project, {}, job_id="job_CANCELFAIL",
+                    )
+                    record.update({
+                        "state": "running", "pid": proc.pid,
+                        "start_token": SERVER.process_start_token(proc.pid),
+                    })
+                    SERVER.write_job(record)
+                    with self.assertRaises(SERVER.ApiError) as raised:
+                        SERVER.cancel_process_job(record["job_id"], record["updated_at"])
+                    self.assertEqual(raised.exception.code, "E_JOB_CANCEL_FAILED")
+                    self.assertEqual(SERVER.read_job(record["job_id"])["state"], "unknown")
+            finally:
+                if proc.poll() is None:
+                    if os.name == "nt":
+                        proc.kill()
+                    else:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=4)
+
+    def test_read_jobs_orders_newest_created_at_first(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-job-order-") as folder:
+            jobs_dir = Path(folder) / "work" / "jobs"
+            with mock.patch.object(SERVER, "JOBS_DIR", jobs_dir):
+                older = {"job_id": "job_ZZZZZZZZ", "created_at": "2026-01-01T00:00:00Z"}
+                newer = {"job_id": "job_AAAAAAAA", "created_at": "2026-02-01T00:00:00Z"}
+                SERVER.write_job(older)
+                SERVER.write_job(newer)
+                self.assertEqual([job["job_id"] for job in SERVER.read_jobs()], ["job_AAAAAAAA", "job_ZZZZZZZZ"])
+
+    def test_invalid_bake_never_replaces_known_good_output(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-bake-validate-") as folder:
+            partial = Path(folder) / "partial.mp4"
+            published = Path(folder) / "published.mp4"
+            partial.write_bytes(b"invalid candidate")
+            published.write_bytes(b"known good")
+            invalid_probe = json.dumps({
+                "format": {"duration": "N/A"},
+                "streams": [{"codec_type": "video"}],
+            })
+            with (
+                mock.patch.object(BAKE, "run", return_value=invalid_probe),
+                self.assertRaises(SystemExit),
+            ):
+                BAKE.publish_validated_bake(str(partial), str(published), 3.0)
+            self.assertEqual(published.read_bytes(), b"known good")
+            self.assertTrue(partial.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group survivor assertion runs in WSL and CI")
+    def test_process_group_cancel_kills_child_that_ignores_sigterm(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-group-survivor-") as folder:
+            ready = Path(folder) / "ready"
+            child_code = (
+                "import pathlib,signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                f"pathlib.Path({str(ready)!r}).write_text('ready');time.sleep(60)"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time;"
+                f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+                f"ready=pathlib.Path({str(ready)!r});deadline=time.time()+5;"
+                "\nwhile not ready.exists() and time.time()<deadline: time.sleep(.01)"
+                "\nprint(child.pid,flush=True);time.sleep(60)"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            try:
+                child_pid = int(proc.stdout.readline().strip())
+                self.assertTrue(ready.exists())
+                token = SERVER.process_start_token(proc.pid)
+                self.assertTrue(token)
+                self.assertTrue(SERVER.terminate_process_group(proc.pid, token))
+                proc.wait(timeout=4)
+                deadline = time.time() + 4
+                while time.time() < deadline and SERVER.pid_is_alive(child_pid):
+                    time.sleep(0.02)
+                self.assertFalse(SERVER.pid_is_alive(child_pid))
+            finally:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait(timeout=4)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX unverifiable-worker assertion runs in WSL and CI")
+    def test_unverifiable_worker_stays_unknown_and_blocks_admission(self):
+        with tempfile.TemporaryDirectory(prefix="video-workbench-no-token-") as folder:
+            project = Path(folder)
+            jobs_dir = project / "work" / "jobs"
+            local_jobs = {
+                "still": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "render": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+                "bake": {"running": False, "log": "", "ok": None, "progress": 0, "job_id": None},
+            }
+            tracked_processes = {}
+            code = "import time;print('PROGRESS 0.5 halfway',flush=True);time.sleep(60)"
+            pid = None
+            with (
+                mock.patch.object(SERVER, "PROJECT", project),
+                mock.patch.object(SERVER, "PROJECT_ARG", str(project)),
+                mock.patch.object(SERVER, "JOBS_DIR", jobs_dir),
+                mock.patch.object(SERVER, "scene_jobs", local_jobs),
+                mock.patch.object(SERVER, "active_processes", tracked_processes),
+                mock.patch.object(SERVER, "process_start_token", return_value=None),
+                mock.patch.object(SERVER, "update_job_progress", side_effect=OSError("disk full")),
+            ):
+                job_id = SERVER.start_scene_job("render", [sys.executable, "-c", code], project)
+                deadline = time.time() + 8
+                record = None
+                while time.time() < deadline:
+                    record = SERVER.read_job(job_id)
+                    if record and record.get("state") == "unknown":
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(record)
+                self.assertEqual(record["state"], "unknown")
+                pid = record["pid"]
+                self.assertTrue(SERVER.pid_is_alive(pid))
+                self.assertIsNone(SERVER.start_scene_job("render", [sys.executable, "-c", "pass"], project))
+            if pid and SERVER.pid_is_alive(pid):
+                os.killpg(pid, signal.SIGKILL)
+                tracked = tracked_processes.pop(job_id, None)
+                try:
+                    if tracked is not None:
+                        tracked.wait(timeout=4)
+                    else:
+                        os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+    def test_windows_taskkill_failure_is_detected(self):
+        failed = subprocess.CompletedProcess(["taskkill"], 1)
+        with (
+            mock.patch.object(SERVER.os, "name", "nt"),
+            mock.patch.object(SERVER, "process_identity_matches", return_value=True),
+            mock.patch.object(SERVER.subprocess, "run", return_value=failed),
+        ):
+            self.assertFalse(SERVER.terminate_process_group(1234, "1234:token"))
+
+    def test_windows_liveness_probe_never_uses_os_kill(self):
+        with (
+            mock.patch.object(SERVER.os, "name", "nt"),
+            mock.patch.object(SERVER, "process_start_token", return_value="1234:token"),
+            mock.patch.object(SERVER.os, "kill", side_effect=AssertionError("os.kill is destructive on Windows")),
+        ):
+            self.assertTrue(SERVER.pid_is_alive(1234))
 
     def test_bake_check_uses_the_shared_validator(self):
         with tempfile.TemporaryDirectory(prefix="video-workbench-bake-") as folder:

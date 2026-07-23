@@ -17,18 +17,23 @@ Scene editor endpoints:
   POST /api/scenes/still     render one Remotion frame for visual selection
   POST /api/scenes/render    render a selected Remotion composition
   POST /api/scenes/bake      bake the full visual timeline over the master
+  POST /api/bake/range       bake a durable range-preview job
+  POST /api/jobs/<id>/cancel cancel a verified local process group
   GET  /api/scenes/jobs      poll still/render/bake progress
+  GET  /api/jobs             list durable job records
 """
 
 from __future__ import annotations
 
 import json
 import io
+import math
 import mimetypes
 import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -87,6 +92,16 @@ def repo_relative(path: Path) -> str:
         return str(path.resolve())
 
 
+def range_label(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def range_output_path(from_s: float, to_s: float) -> Path:
+    return project_write_path(
+        PROJECT / "work" / "preview" / f"range-{range_label(from_s)}-{range_label(to_s)}.mp4"
+    )
+
+
 def project_write_path(path: Path) -> Path:
     """Resolve a write target and reject symlink/junction escapes."""
     resolved = path.resolve(strict=False)
@@ -128,15 +143,18 @@ STATIC = {
 
 render_state = {"running": False, "log": "", "ok": None}
 scene_jobs = {
-    "still": {"running": False, "log": "", "ok": None, "url": None, "id": None, "job_id": None},
-    "render": {"running": False, "log": "", "ok": None, "id": None, "job_id": None},
-    "bake": {"running": False, "log": "", "ok": None, "output": None, "job_id": None},
+    "still": {"running": False, "log": "", "ok": None, "progress": 0, "url": None, "id": None, "job_id": None},
+    "render": {"running": False, "log": "", "ok": None, "progress": 0, "id": None, "job_id": None},
+    "bake": {"running": False, "log": "", "ok": None, "progress": 0, "output": None, "job_id": None},
 }
-job_lock = threading.Lock()
+job_lock = threading.RLock()
 timeline_lock = threading.Lock()
+active_processes: dict[str, subprocess.Popen] = {}
+canceling_jobs: set[str] = set()
 
 MAX_UPLOAD_BYTES = int(os.environ.get("CYE_MAX_UPLOAD_BYTES", 20 * 1024 * 1024 * 1024))
 MAX_MULTIPART_FIELD_BYTES = 64 * 1024
+MAX_JSON_BODY_BYTES = int(os.environ.get("CYE_MAX_JSON_BODY_BYTES", 8 * 1024 * 1024))
 FFPROBE_TIMEOUT_S = max(1.0, float(os.environ.get("CYE_FFPROBE_TIMEOUT_S", 120)))
 FFMPEG_TIMEOUT_S = max(1.0, float(os.environ.get("CYE_FFMPEG_TIMEOUT_S", 7200)))
 MAX_CONCURRENT_CONFORMS = max(1, min(8, int(os.environ.get("CYE_MAX_CONCURRENT_CONFORMS", 2))))
@@ -724,29 +742,69 @@ def write_job(record: dict) -> None:
             temp_path.unlink()
 
 
+def write_json_atomic(path: Path, value: dict) -> None:
+    """Write server-owned JSON without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temp_path = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+
 def read_jobs() -> list[dict]:
     records = []
     if not JOBS_DIR.exists():
         return records
-    for path in sorted(JOBS_DIR.glob("job_*.json"), reverse=True):
+    for path in JOBS_DIR.glob("job_*.json"):
         try:
             record = read_json(path)
             if isinstance(record, dict):
                 records.append(record)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
+    records.sort(
+        key=lambda record: (str(record.get("created_at", "")), str(record.get("job_id", ""))),
+        reverse=True,
+    )
     return records
+
+
+def read_job(job_id: str) -> dict | None:
+    if not re.fullmatch(r"job_[A-Za-z0-9]{8,32}", job_id):
+        return None
+    try:
+        record = read_json(JOBS_DIR / f"{job_id}.json")
+        return record if isinstance(record, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def linux_proc_stat_fields(pid: int) -> list[str] | None:
+    """Return /proc stat fields 3..N without being confused by spaces in comm."""
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if not proc_stat.exists():
+        return None
+    try:
+        _, suffix = proc_stat.read_text(encoding="utf-8").rsplit(")", 1)
+        fields = suffix.split()
+        return fields if len(fields) >= 20 else None
+    except (OSError, ValueError):
+        return None
 
 
 def process_start_token(pid: int) -> str | None:
     """Return a PID-reuse-safe token on Linux/WSL and Windows."""
-    proc_stat = Path(f"/proc/{pid}/stat")
-    if proc_stat.exists():
-        try:
-            fields = proc_stat.read_text(encoding="utf-8").split()
-            return f"{pid}:{fields[21]}"
-        except (OSError, IndexError):
-            return None
+    proc_fields = linux_proc_stat_fields(pid)
+    if proc_fields is not None:
+        return f"{pid}:{proc_fields[19]}"
     if os.name == "nt":
         command = [
             "powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -767,6 +825,11 @@ def process_start_token(pid: int) -> str | None:
 
 
 def pid_is_alive(pid: int) -> bool:
+    proc_fields = linux_proc_stat_fields(pid)
+    if proc_fields is not None:
+        return proc_fields[0] != "Z"
+    if os.name == "nt":
+        return process_start_token(pid) is not None
     try:
         os.kill(pid, 0)
         return True
@@ -774,42 +837,100 @@ def pid_is_alive(pid: int) -> bool:
         return False
 
 
+def reconcile_job_record(record: dict) -> dict:
+    """Mark one interrupted local job honestly after a server restart."""
+    if record.get("state") not in {"queued", "submitted", "running"}:
+        return record
+    job_id = record.get("job_id")
+    with job_lock:
+        owned_here = job_id in active_processes or any(
+            state.get("running") and state.get("job_id") == job_id for state in scene_jobs.values()
+        )
+    if owned_here:
+        return record
+    pid = record.get("pid")
+    current_token = process_start_token(pid) if isinstance(pid, int) and pid_is_alive(pid) else None
+    expected = record.get("start_token")
+    if not isinstance(pid, int) or not pid_is_alive(pid) or (current_token and expected and current_token != expected):
+        record["state"] = "orphaned"
+        record["message"] = "worker is no longer running; retry requires human action"
+    elif current_token is None or expected is None:
+        record["state"] = "unknown"
+        record["message"] = "worker PID exists but its start token cannot be verified"
+    else:
+        return record
+    record["updated_at"] = utc_now()
+    record["completed_at"] = record["updated_at"]
+    write_job(record)
+    return record
+
+
 def reconcile_jobs() -> list[dict]:
-    """Mark interrupted local jobs honestly after a server restart."""
-    records = read_jobs()
-    for record in records:
-        if record.get("state") not in {"queued", "submitted", "running"}:
-            continue
-        pid = record.get("pid")
-        current_token = process_start_token(pid) if isinstance(pid, int) and pid_is_alive(pid) else None
-        expected = record.get("start_token")
-        if not isinstance(pid, int) or not pid_is_alive(pid) or (current_token and expected and current_token != expected):
-            record["state"] = "orphaned"
-            record["message"] = "worker is no longer running; retry requires human action"
-        elif current_token is None or expected is None:
-            record["state"] = "unknown"
-            record["message"] = "worker PID exists but its start token cannot be verified"
+    return [reconcile_job_record(record) for record in read_jobs()]
+
+
+def reconcile_job(job_id: str) -> dict | None:
+    record = read_job(job_id)
+    return reconcile_job_record(record) if record else None
+
+
+def job_artifact_path(job_id: str, published_output: str) -> Path:
+    suffix = Path(published_output).suffix or ".bin"
+    return project_write_path(JOBS_DIR / job_id / f"output{suffix}")
+
+
+def capture_job_artifact(job_id: str, published_output: str, *, prefer_hardlink: bool = False) -> Path:
+    """Snapshot a published output into the job's immutable artifact directory."""
+    source, outside = resolve_persisted_path(ROOT, PROJECT, published_output)
+    if outside or source is None or not source.is_file():
+        raise OSError(f"published job artifact was not found: {published_output}")
+    destination = job_artifact_path(job_id, published_output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(f".{destination.name}.{secrets.token_hex(6)}.tmp")
+    try:
+        if prefer_hardlink:
+            try:
+                os.link(source, temp_path)
+            except OSError:
+                shutil.copy2(source, temp_path)
         else:
-            continue
-        record["updated_at"] = utc_now()
-        record["completed_at"] = record["updated_at"]
-        write_job(record)
-    return read_jobs()
+            shutil.copy2(source, temp_path)
+        os.replace(temp_path, destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return destination
 
 
-def create_job_record(kind: str, command: list[str], cwd: Path, initial: dict) -> dict:
-    job_id = new_uid("job")
+def cleanup_bake_scratch(published_output: str | None, pid: int | None) -> None:
+    if not published_output or not isinstance(pid, int):
+        return
+    output, outside = resolve_persisted_path(ROOT, PROJECT, published_output)
+    if outside or output is None:
+        return
+    scratch = project_write_path(output.parent / f"_bake_tmp_{pid}")
+    if scratch.is_dir():
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def create_job_record(kind: str, command: list[str], cwd: Path, initial: dict, job_id: str | None = None) -> dict:
+    job_id = job_id or new_uid("job")
     now = utc_now()
     durable_kind = "bake" if kind == "bake" else "render"
-    spec = {"command": command, "cwd": repo_relative(cwd), "ui_kind": kind}
-    input_bytes = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    spec = {
+        "command": command,
+        "cwd": repo_relative(cwd),
+        "ui_kind": kind,
+        "timeline_etag": initial.get("timeline_etag"),
+    }
     expected = []
     output_dir = repo_relative(REMOTION_DIR / "out")
-    if kind == "render" and initial.get("id"):
-        expected = [f"remotion/out/{initial['id']}.mp4"]
-    if kind == "bake" and initial.get("output"):
-        expected = [str(initial["output"])]
-        output_dir = str(Path(str(initial["output"])).parent).replace("\\", "/")
+    if initial.get("output"):
+        artifact = job_artifact_path(job_id, str(initial["output"]))
+        expected = [repo_relative(artifact)]
+        output_dir = repo_relative(artifact.parent)
+        spec["published_output"] = str(initial["output"])
+    input_bytes = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
     record = {
         "job_id": job_id,
         "kind": durable_kind,
@@ -836,63 +957,277 @@ def create_job_record(kind: str, command: list[str], cwd: Path, initial: dict) -
         "updated_at": now,
         "completed_at": None,
     }
+    if isinstance(initial.get("range"), dict):
+        record["range"] = dict(initial["range"])
     write_job(record)
     return record
 
 
+def update_job_progress(job_id: str, progress: float, message: str) -> None:
+    with job_lock:
+        record = read_job(job_id)
+        if not record or record.get("state") != "running" or job_id in canceling_jobs:
+            return
+        record["progress"] = max(float(record.get("progress", 0)), min(1.0, max(0.0, progress)))
+        record["message"] = message or "running"
+        record["updated_at"] = utc_now()
+        write_job(record)
+
+
 def run_process_job(kind: str, command: list[str], cwd: Path, job_id: str, **initial) -> None:
     state = scene_jobs[kind]
-    state.update(running=True, log="", ok=None, job_id=job_id, **initial)
-    record = next((item for item in read_jobs() if item.get("job_id") == job_id), None)
+    state.update(running=True, log="", ok=None, progress=0, job_id=job_id, **initial)
+    proc = None
+    proc_token = None
+    worker_stopped = True
     try:
         env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
         if command and command[0] == "node" and "--use-system-ca" not in env.get("NODE_OPTIONS", ""):
             env["NODE_OPTIONS"] = (env.get("NODE_OPTIONS", "") + " --use-system-ca").strip()
+        process_group_options = (
+            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            if os.name == "nt" else {"start_new_session": True}
+        )
         proc = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, cwd=str(cwd), encoding="utf-8", errors="replace",
-            env=env,
+            env=env, **process_group_options,
         )
-        if record is not None:
-            now = utc_now()
-            record.update({
-                "state": "running", "message": "running", "pid": proc.pid,
-                "start_token": process_start_token(proc.pid), "started_at": now, "updated_at": now,
-            })
-            write_job(record)
+        worker_stopped = False
+        with job_lock:
+            active_processes[job_id] = proc
+            proc_token = process_start_token(proc.pid)
+            record = read_job(job_id)
+            if record is not None and record.get("state") != "canceled":
+                now = utc_now()
+                record.update({
+                    "state": "running", "message": "running", "pid": proc.pid,
+                    "progress": 0.01, "start_token": proc_token,
+                    "started_at": now, "updated_at": now,
+                })
+                write_job(record)
+                state["progress"] = 0.01
         assert proc.stdout is not None
         for line in proc.stdout:
             state["log"] += line
             if len(state["log"]) > 30000:
                 state["log"] = state["log"][-30000:]
+            progress_match = re.match(r"^PROGRESS\s+([0-9]*\.?[0-9]+)(?:\s+(.*))?$", line.strip())
+            if progress_match:
+                progress = min(1.0, max(0.0, float(progress_match.group(1))))
+                message = (progress_match.group(2) or "running").strip()
+                state["progress"] = progress
+                update_job_progress(job_id, progress, message)
         proc.wait()
-        state["ok"] = proc.returncode == 0
-        if record is not None:
-            now = utc_now()
-            record.update({
-                "state": "succeeded" if proc.returncode == 0 else "failed",
-                "progress": 1 if proc.returncode == 0 else record.get("progress", 0),
-                "message": "completed" if proc.returncode == 0 else "process exited with an error",
-                "exit_code": proc.returncode,
-                "error": None if proc.returncode == 0 else {"code": "E_PROCESS_EXIT", "message": state["log"][-2000:]},
-                "updated_at": now,
-                "completed_at": now,
-            })
-            write_job(record)
+        if proc.returncode == 0 and initial.get("output"):
+            update_job_progress(job_id, 0.99, "publishing immutable artifact")
+            capture_job_artifact(job_id, str(initial["output"]), prefer_hardlink=kind == "bake")
+        with job_lock:
+            active_processes.pop(job_id, None)
+            record = read_job(job_id)
+            if record is not None:
+                now = utc_now()
+                if job_id in canceling_jobs:
+                    state["ok"] = False
+                    record.update({"exit_code": proc.returncode, "updated_at": now})
+                elif record.get("state") in {"canceled", "unknown", "orphaned"}:
+                    state["ok"] = False
+                    record.update({"exit_code": proc.returncode, "updated_at": now, "completed_at": now})
+                else:
+                    state["ok"] = proc.returncode == 0
+                    record.update({
+                        "state": "succeeded" if proc.returncode == 0 else "failed",
+                        "progress": 1 if proc.returncode == 0 else record.get("progress", 0),
+                        "message": "completed" if proc.returncode == 0 else "process exited with an error",
+                        "exit_code": proc.returncode,
+                        "error": None if proc.returncode == 0 else {"code": "E_PROCESS_EXIT", "message": state["log"][-2000:]},
+                        "updated_at": now,
+                        "completed_at": now,
+                    })
+                write_job(record)
     except Exception as exc:  # noqa: BLE001
         state["log"] += f"\n{type(exc).__name__}: {exc}\n"
         state["ok"] = False
-        if record is not None:
-            now = utc_now()
-            record.update({
-                "state": "failed", "message": str(exc), "updated_at": now, "completed_at": now,
-                "error": {"code": "E_PROCESS_START", "message": str(exc)},
-            })
-            write_job(record)
-    finally:
-        state["running"] = False
+        if proc is not None:
+            if proc.poll() is not None:
+                worker_stopped = True
+            elif proc_token:
+                worker_stopped = terminate_process_group(proc.pid, proc_token)
+                try:
+                    proc.wait(timeout=2)
+                    worker_stopped = True
+                except subprocess.TimeoutExpired:
+                    worker_stopped = False
         with job_lock:
-            pass
+            record = read_job(job_id)
+            if record is not None:
+                now = utc_now()
+                if job_id in canceling_jobs:
+                    record.update({"exit_code": proc.returncode if proc else None, "updated_at": now})
+                elif record.get("state") not in {"canceled", "unknown", "orphaned"}:
+                    if worker_stopped:
+                        record.update({
+                            "state": "failed", "message": str(exc), "updated_at": now, "completed_at": now,
+                            "error": {"code": "E_PROCESS_EXEC", "message": str(exc)},
+                        })
+                    else:
+                        record.update({
+                            "state": "unknown", "message": "worker cleanup could not be confirmed",
+                            "updated_at": now, "completed_at": now,
+                            "error": {"code": "E_PROCESS_CLEANUP", "message": str(exc)},
+                        })
+                write_job(record)
+    finally:
+        with job_lock:
+            if proc is None or worker_stopped:
+                active_processes.pop(job_id, None)
+            else:
+                active_processes[job_id] = proc
+        if proc is not None and proc.stdout is not None:
+            proc.stdout.close()
+        cleanup_bake_scratch(initial.get("output") if kind == "bake" else None, proc.pid if proc else None)
+        state["running"] = False
+
+
+def process_identity_matches(pid: int, expected_token: str) -> bool:
+    return pid_is_alive(pid) and process_start_token(pid) == expected_token
+
+
+def process_group_exists(pgid: int) -> bool:
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        try:
+            entries = list(proc_root.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            fields = linux_proc_stat_fields(int(entry.name))
+            if fields is None:
+                continue
+            try:
+                state, member_group = fields[0], int(fields[2])
+            except (IndexError, ValueError):
+                continue
+            if member_group == pgid and state != "Z":
+                return True
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def terminate_process_group(pid: int, expected_token: str) -> bool:
+    """Terminate one verified process tree/group and confirm the old worker is gone."""
+    if not process_identity_matches(pid, expected_token):
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0 and process_identity_matches(pid, expected_token):
+            return False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and process_identity_matches(pid, expected_token):
+            time.sleep(0.02)
+        return not process_identity_matches(pid, expected_token)
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    if pgid != pid or not process_identity_matches(pid, expected_token):
+        return False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not process_group_exists(pgid):
+            return True
+        time.sleep(0.02)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and process_group_exists(pgid):
+        time.sleep(0.02)
+    return not process_group_exists(pgid)
+
+
+def cancel_process_job(job_id: str, supplied_token: str | None) -> dict:
+    with job_lock:
+        record = read_job(job_id)
+        if record is None:
+            raise ApiError(404, "E_JOB_NOT_FOUND", "job was not found")
+        token = (supplied_token or "").strip().strip('"')
+        if not token:
+            raise ApiError(428, "E_JOB_TOKEN_REQUIRED", "job updated_at token is required")
+        if not secrets.compare_digest(token, str(record.get("updated_at", ""))):
+            raise ApiError(409, "E_JOB_TOKEN_MISMATCH", "job changed since it was loaded", {"job": record})
+        if record.get("state") == "canceled":
+            return record
+        if record.get("state") not in {"queued", "submitted", "running"}:
+            raise ApiError(409, "E_JOB_NOT_RUNNING", "only an active job can be canceled", {"job": record})
+        pid = record.get("pid")
+        expected_token = record.get("start_token")
+        current_token = process_start_token(pid) if isinstance(pid, int) and pid_is_alive(pid) else None
+        if not isinstance(pid, int) or not expected_token or current_token != expected_token:
+            raise ApiError(409, "E_JOB_IDENTITY_MISMATCH", "job worker identity could not be verified")
+        if os.name != "nt":
+            try:
+                if os.getpgid(pid) != pid:
+                    raise ApiError(409, "E_JOB_GROUP_UNVERIFIED", "job does not own a dedicated process group")
+            except ProcessLookupError as exc:
+                raise ApiError(409, "E_JOB_IDENTITY_MISMATCH", "job worker is no longer running") from exc
+        canceling_jobs.add(job_id)
+        record.update({"message": "canceling", "updated_at": utc_now()})
+        write_job(record)
+        for state in scene_jobs.values():
+            if state.get("job_id") == job_id:
+                state["ok"] = False
+    try:
+        terminated = terminate_process_group(pid, expected_token)
+    except (OSError, subprocess.SubprocessError):
+        terminated = False
+    with job_lock:
+        canceling_jobs.discard(job_id)
+        record = read_job(job_id) or record
+        now = utc_now()
+        if not terminated:
+            if record.get("state") in {"queued", "submitted", "running"}:
+                record.update({
+                    "state": "unknown", "message": "cancellation could not be confirmed",
+                    "updated_at": now, "completed_at": now,
+                    "error": {"code": "E_JOB_CANCEL_FAILED", "message": "worker may still be running"},
+                })
+                write_job(record)
+            raise ApiError(500, "E_JOB_CANCEL_FAILED", "job cancellation could not be confirmed", {"job": record})
+        if record.get("state") not in {"queued", "submitted", "running"}:
+            raise ApiError(409, "E_JOB_NOT_RUNNING", "job finished before cancellation completed", {"job": record})
+        record.update({
+            "state": "canceled", "message": "canceled by user", "updated_at": now,
+            "completed_at": now, "error": None,
+        })
+        write_job(record)
+        return record
 
 
 def run_cut_render(style: str) -> None:
@@ -913,13 +1248,43 @@ def run_cut_render(style: str) -> None:
         render_state.update(running=False, ok=False, log=render_state["log"] + str(exc))
 
 
-def start_scene_job(kind: str, command: list[str], cwd: Path, **initial) -> str | None:
+def start_scene_job(
+    kind: str,
+    command: list[str],
+    cwd: Path,
+    *,
+    timeline_document: dict | None = None,
+    **initial,
+) -> str | None:
     with job_lock:
         if any(job["running"] for job in scene_jobs.values()):
             return None
-        record = create_job_record(kind, command, cwd, initial)
-        job_id = record["job_id"]
-        scene_jobs[kind].update(running=True, log="queued...\n", ok=None, job_id=job_id, **initial)
+        durable_records = reconcile_jobs()
+        if any(record.get("state") in {"queued", "submitted", "running"} for record in durable_records):
+            return None
+        if any(
+            record.get("state") == "unknown"
+            and isinstance(record.get("pid"), int)
+            and pid_is_alive(record["pid"])
+            for record in durable_records
+        ):
+            return None
+        if any(
+            isinstance(record.get("pid"), int)
+            and record.get("start_token")
+            and process_identity_matches(record["pid"], record["start_token"])
+            for record in durable_records
+        ):
+            return None
+        job_id = new_uid("job")
+        command = list(command)
+        if timeline_document is not None:
+            snapshot_path = project_write_path(JOBS_DIR / job_id / "timeline.json")
+            write_json_atomic(snapshot_path, timeline_document)
+            command = [str(snapshot_path) if value == "{timeline}" else value for value in command]
+            initial["timeline_snapshot"] = repo_relative(snapshot_path)
+        record = create_job_record(kind, command, cwd, initial, job_id=job_id)
+        scene_jobs[kind].update(running=True, log="queued...\n", ok=None, progress=0, job_id=job_id, **initial)
         thread = threading.Thread(
             target=run_process_job, args=(kind, command, cwd, job_id), kwargs=initial, daemon=True
         )
@@ -936,6 +1301,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -1101,10 +1468,10 @@ class Handler(BaseHTTPRequestHandler):
                 if content_type.lower().startswith("multipart/form-data"):
                     source, original_name, fields = parse_multipart_upload(self, staging)
                 elif content_type.lower().startswith("application/json"):
+                    body = self.read_body()
                     supplied_cli_token = self.headers.get("X-Workbench-CLI-Token", "")
                     if not secrets.compare_digest(supplied_cli_token, CLI_IMPORT_TOKEN):
                         raise ApiError(403, "E_PATH_IMPORT_FORBIDDEN", "server-side path import is CLI-only")
-                    body = self.read_body()
                     if body is None or not isinstance(body.get("path"), str):
                         raise ApiError(400, "E_PATH_REQUIRED", "CLI path import requires a path")
                     resolved, outside = resolve_persisted_path(ROOT, PROJECT, body["path"])
@@ -1313,6 +1680,21 @@ class Handler(BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
         self.send_file_ranged(resolved, content_type)
 
+    def send_job_media(self, path: str) -> None:
+        match = re.fullmatch(r"/media/job/(job_[A-Za-z0-9]{8,32})", path)
+        record = read_job(match.group(1)) if match else None
+        if not record or record.get("state") != "succeeded":
+            self.send_json({"error": "job output is not available"}, 409 if record else 404)
+            return
+        artifacts = record.get("expected_artifacts", []) if record else []
+        artifact = artifacts[0] if artifacts else ""
+        resolved, outside = resolve_persisted_path(ROOT, PROJECT, artifact)
+        if outside or resolved is None or not resolved.is_file():
+            self.send_json({"error": "job output was not found"}, 404)
+            return
+        content_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        self.send_file_ranged(resolved, content_type)
+
     def send_master_media(self) -> None:
         timeline, _ = timeline_snapshot()
         resolved, outside = resolve_persisted_path(ROOT, PROJECT, timeline.get("master", ""))
@@ -1381,9 +1763,17 @@ class Handler(BaseHTTPRequestHandler):
     def read_body(self) -> dict | None:
         try:
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            if length < 0 or length > MAX_JSON_BODY_BYTES:
+                self.close_connection = True
+                return None
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                self.close_connection = True
+                return None
+            body = json.loads(raw or b"{}")
             return body if isinstance(body, dict) else None
         except (ValueError, json.JSONDecodeError):
+            self.close_connection = True
             return None
 
     def do_GET(self):
@@ -1451,6 +1841,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(scene_jobs)
         elif path == "/api/jobs":
             self.send_json({"jobs": reconcile_jobs()})
+        elif re.fullmatch(r"/api/jobs/job_[A-Za-z0-9]{8,32}", path):
+            job = reconcile_job(path.rsplit("/", 1)[-1])
+            self.send_json({"job": job} if job else {"error": "job was not found"}, 200 if job else 404)
         elif path.startswith("/media/take/"):
             if not self.authorize_take_media():
                 return
@@ -1459,6 +1852,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorize_take_media():
                 return
             self.send_master_media()
+        elif path.startswith("/media/job/"):
+            if not self.authorize_take_media():
+                return
+            self.send_job_media(path)
         elif path.startswith("/media/remotion-preview/"):
             name = Path(path).name
             if name != path.rsplit("/", 1)[-1] or not name.endswith(".png"):
@@ -1484,7 +1881,24 @@ class Handler(BaseHTTPRequestHandler):
             r"/api/scene/(scn_[A-Za-z0-9]{8,32})/takes/(take_[A-Za-z0-9]{8,32})/promote", path
         )
         if promote_match:
+            if self.read_body() is None:
+                self.send_json({"error": "invalid JSON body"}, 400)
+                return
             self.handle_take_promote(*promote_match.groups())
+            return
+        cancel_match = re.fullmatch(r"/api/jobs/(job_[A-Za-z0-9]{8,32})/cancel", path)
+        if cancel_match:
+            if self.read_body() is None:
+                self.send_json({"error": "invalid JSON body"}, 400)
+                return
+            try:
+                record = cancel_process_job(
+                    cancel_match.group(1),
+                    self.headers.get("If-Match") or self.headers.get("If-Unmodified-Since"),
+                )
+                self.send_json({"canceled": True, "job": record})
+            except ApiError as error:
+                self.send_api_error(error)
             return
         body = self.read_body()
         if body is None:
@@ -1518,6 +1932,55 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"started": True})
             return
 
+        if path == "/api/bake/range":
+            try:
+                from_s = float(body.get("from_s"))
+                to_s = float(body.get("to_s"))
+            except (TypeError, ValueError):
+                self.send_json({"error": "from_s and to_s must be numbers"}, 400)
+                return
+            if not math.isfinite(from_s) or not math.isfinite(to_s) or from_s < 0 or to_s <= from_s:
+                self.send_json({"error": "range must satisfy 0 <= from_s < to_s"}, 400)
+                return
+            with timeline_lock:
+                if not self.require_timeline_match():
+                    return
+                if not TIMELINE.exists():
+                    self.send_json({"error": "save the scene timeline before baking"}, 400)
+                    return
+                timeline = load_timeline()
+                preview_end = float(timeline.get("preview", {}).get("end_s", 0))
+                if to_s > preview_end + 1e-6:
+                    self.send_json({"error": f"to_s must be <= preview end ({preview_end:g})"}, 400)
+                    return
+                blocking = [item for item in project_validation(timeline) if item.get("severity") == "E"]
+                if blocking:
+                    self.send_json({"error": "bake blocked by project validation", "issues": blocking}, 409)
+                    return
+                from_s = round(from_s, 6)
+                to_s = round(to_s, 6)
+                output = range_output_path(from_s, to_s)
+                timeline_etag_value = timeline_etag()
+                command = [
+                    sys.executable, str(ROOT / "tools" / "bake.py"), "{timeline}",
+                    "--from", str(from_s), "--end", str(to_s),
+                ]
+                job_id = start_scene_job(
+                    "bake", command, ROOT, timeline_document=timeline,
+                    output=repo_relative(output), range={"from_s": from_s, "to_s": to_s},
+                    timeline_etag=timeline_etag_value,
+                )
+            if not job_id:
+                self.send_json({"error": "another scene job is already running"}, 409)
+                return
+            self.send_json({
+                "started": True,
+                "job_id": job_id,
+                "output": repo_relative(output),
+                "media_url": f"/media/job/{job_id}",
+            }, 202)
+            return
+
         if path == "/api/scenes/save":
             self.save_timeline_document(body.get("timeline"))
             return
@@ -1540,7 +2003,10 @@ class Handler(BaseHTTPRequestHandler):
             filename = f"{scene_id}-f{frame:04d}.png"
             url = f"/media/remotion-preview/{filename}"
             command = ["node", "scripts/frames.mjs", scene_id, str(frame), "--scale=0.5"]
-            job_id = start_scene_job("still", command, REMOTION_DIR, id=scene_id, url=url)
+            job_id = start_scene_job(
+                "still", command, REMOTION_DIR, id=scene_id, url=url,
+                output=repo_relative(REMOTION_DIR / "out" / "qa" / filename),
+            )
             if not job_id:
                 self.send_json({"error": "another scene job is already running"}, 409)
                 return
@@ -1551,8 +2017,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self.require_timeline_match():
                 return
             scene_id = str(body.get("id", ""))
-            catalog_ids = {str(item.get("id")) for item in remotion_catalog()}
-            if scene_id not in catalog_ids:
+            catalog = {str(item.get("id")): item for item in remotion_catalog()}
+            if scene_id not in catalog:
                 self.send_json({"error": "unknown Remotion composition"}, 400)
                 return
             scale = body.get("scale", 1)
@@ -1560,7 +2026,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "scale must be 0.5, 1, or 2"}, 400)
                 return
             command = ["node", "scripts/render-all.mjs", f"--scale={scale}", scene_id]
-            job_id = start_scene_job("render", command, REMOTION_DIR, id=scene_id)
+            extension = ".mov" if catalog[scene_id].get("transparent") else ".mp4"
+            job_id = start_scene_job(
+                "render", command, REMOTION_DIR, id=scene_id,
+                output=repo_relative(REMOTION_DIR / "out" / f"{scene_id}{extension}"),
+            )
             if not job_id:
                 self.send_json({"error": "another scene job is already running"}, 409)
                 return
@@ -1568,22 +2038,26 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/scenes/bake":
-            if not self.require_timeline_match():
-                return
-            if not TIMELINE.exists():
-                self.send_json({"error": "save the scene timeline before baking"}, 400)
-                return
-            issues = project_validation()
-            blocking = [item for item in issues if item.get("severity") == "E"]
-            if blocking:
-                self.send_json({
-                    "error": "bake blocked by project validation",
-                    "issues": blocking,
-                }, 409)
-                return
-            output = load_timeline().get("preview", {}).get("out")
-            command = [sys.executable, str(ROOT / "tools" / "bake.py"), str(TIMELINE)]
-            job_id = start_scene_job("bake", command, ROOT, output=output)
+            with timeline_lock:
+                if not self.require_timeline_match():
+                    return
+                if not TIMELINE.exists():
+                    self.send_json({"error": "save the scene timeline before baking"}, 400)
+                    return
+                timeline = load_timeline()
+                blocking = [item for item in project_validation(timeline) if item.get("severity") == "E"]
+                if blocking:
+                    self.send_json({
+                        "error": "bake blocked by project validation",
+                        "issues": blocking,
+                    }, 409)
+                    return
+                output = timeline.get("preview", {}).get("out")
+                command = [sys.executable, str(ROOT / "tools" / "bake.py"), "{timeline}"]
+                job_id = start_scene_job(
+                    "bake", command, ROOT, timeline_document=timeline,
+                    output=output, timeline_etag=timeline_etag(),
+                )
             if not job_id:
                 self.send_json({"error": "another scene job is already running"}, 409)
                 return

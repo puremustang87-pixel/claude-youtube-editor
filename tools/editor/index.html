@@ -22,10 +22,10 @@
   select, input[type=range] { background: var(--panel2); color: var(--text); border: 1px solid #3a4050; border-radius: 5px; padding: 4px; }
 
   header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--panel);
-           border-bottom: 1px solid #000; flex-wrap: wrap; }
+           border-bottom: 1px solid #000; flex-wrap: nowrap; }
   header .title { font-weight: 600; margin-right: 6px; }
   header .grow { flex: 1; }
-  #status { color: var(--dim); max-width: 340px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status { color: var(--dim); max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #status.ok { color: #6fce8f; } #status.err { color: #e37c7c; }
 
   #main { flex: 1; display: flex; min-height: 0; }
@@ -92,6 +92,11 @@
   <span id="sceneTimeinfo" class="scene-only hidden"></span>
   <span class="grow"></span>
   <span id="status"></span>
+  <span id="sceneJobChip" class="scene-only scene-job-chip idle hidden" aria-live="polite">
+    <i class="scene-job-dot"></i>
+    <span id="sceneJobLabel">Jobs idle</span>
+    <button id="sceneJobCancel" type="button" class="hidden">Cancel</button>
+  </span>
   <button id="saveBtn" class="cut-only" disabled>Save cut</button>
   <button id="renderBtn" class="cut-only primary">Render cut</button>
   <button id="sceneSaveBtn" class="scene-only hidden" disabled>Save scenes</button>
@@ -156,7 +161,7 @@
       <div id="sceneTakeStrip" class="scene-take-strip"></div>
       <input id="sceneTakeInput" class="hidden" type="file" accept="video/*,.mov,.mkv,.webm,.m4v">
     </section>
-    <pre id="sceneJobLog" class="scene-job-log">No render job running.</pre>
+    <pre id="sceneJobLog" class="hidden" aria-hidden="true"></pre>
   </main>
 
   <aside id="sceneInspector" class="scene-panel">
@@ -189,7 +194,7 @@
   <div id="sceneTlbar">
     <span>zoom <input id="sceneZoom" type="range" min="4" max="40" value="8"></span>
     <span class="scene-legend"><i class="cutaway"></i> cutaway <i class="overlay"></i> overlay <i class="planned"></i> planned/disabled</span>
-    <span class="scene-muted">Drag a block to move it. Drag either edge to retime it.</span>
+    <span class="scene-muted">Drag to retime · <b>B</b> preview selected scene ±2s.</span>
   </div>
   <div id="sceneTimeline"><div id="sceneTimelineInner">
     <div class="scene-track-label cutaway-label">CUTAWAYS</div>
