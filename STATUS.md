@@ -2,7 +2,7 @@
 
 **The one page that says what's real.** Updated with every merge. If it isn't reflected here and merged to `main`, it isn't real yet.
 
-_Last updated: 2026-07-22 07:10 UTC+1 · maintained by whoever merges_
+_Last updated: 2026-07-23 02:15 UTC+1 · maintained by whoever merges_
 
 ## How this repo works (the 10-second version)
 
@@ -18,22 +18,21 @@ Nothing reaches `main` without an owner merge. Codex builds on `codex/*` branche
 
 - ✅ **Docs bridge** (`1d17a67`) — contracts v2.1, UI redesign packet, next-level pipeline, reviews. See `docs/README-BRIDGE.md`.
 - ✅ **Control Kit** (`d778c34`, `e170d66`) — STATUS.md, PR template, CI on every push.
+- ✅ **PR #1 — engine foundation slice** — merged. Identity split, migration, immutable takes, etag+atomic saves, durable jobs, validator, security.
 
 ## In review (open PRs)
 
-- 🔍 **PR #1 — engine foundation slice** · branch `codex/fable5-engine-foundation` · commit `134f9bc`
-  - Fable review: **posted** (COMMENT). Verdict: strong foundation, merge after fixes.
-  - ✅ F1–F4 fixes pushed: atomic ETag save lock, cached legacy hashing, canonical take paths,
-    and a self-contained clean-checkout test suite.
-  - ✅ 15 tests pass; the two-writer race regression repeatedly returns one `200` and one `409`.
-  - **Next action: Fable re-audits commit `134f9bc` → owner merges.**
+- ✅ **PR #2 — take ingestion + Takes drawer** · branch `codex/take-ingest-drawer` · `92ddc8b` — **CLEARED TO MERGE (owner's click)**
+  - Fable executed audit: 23/23 tests pass (FFmpeg conform/alpha/VFR genuinely ran), independent traversal probe rejected all 4 vectors, concurrency verified (conform runs outside the lock).
+  - Multipart parsing safe by construction · ProRes-4444 overlays + H.264 cutaways with post-conform re-probe · dedup + canonical namespace + atomic promote. **Zero bugs found.**
+  - Non-blocking notes for later: cuts.json save lock (still deferred); move conform to the job queue when providers land.
 
 ## Next up (not started)
 
-1. Next slice: multipart take import + conform pipeline + explicit promote endpoint.
-2. Takes drawer in the inspector (compare/promote UI).
-3. Remotion render-to-take with typed props; then Fable/Hyperframe courier adapters.
-4. Script-driven pipeline N1 (ingest) — see `docs/next-level/NEXT-LEVEL.md`.
+1. **Merge PR #2** (owner), then Codex starts: provider/courier adapters (Fable/Hyperframe) on the job+take contract.
+2. Hyperframe generation + richer scene editing (typed Remotion props).
+3. Script-driven pipeline N1 (ingest) — see `docs/next-level/NEXT-LEVEL.md`.
+4. Sweep the deferred `cuts.json` save lock when the Cut workspace is next touched.
 
 ## Standing risks (do not forget)
 
