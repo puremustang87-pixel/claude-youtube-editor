@@ -2,7 +2,7 @@
 
 **The one page that says what's real.** Updated with every merge. If it isn't reflected here and merged to `main`, it isn't real yet.
 
-_Last updated: 2026-07-23 04:35 UTC+1 · maintained by whoever merges_
+_Last updated: 2026-07-23 05:00 UTC+1 · maintained by whoever merges_
 
 ## How this repo works (the 10-second version)
 
@@ -20,17 +20,18 @@ Nothing reaches `main` without an owner merge. Codex builds on `codex/*` branche
 - ✅ **Control Kit** (`d778c34`, `e170d66`) — STATUS.md, PR template, CI on every push.
 - ✅ **PR #1 — engine foundation slice** — merged.
 - ✅ **PR #2 — take ingestion + Takes drawer** — merged. 23/23 tests, multipart import, conform profiles, promote.
+- ✅ **PR #3 — durable range bake + job progress** — merged (`526aaf6`). Range bake, immutable per-job artifacts, verified cancel, Windows os.kill liveness fix.
 
 ## In review (open PRs)
 
-- ✅ **PR #3 — durable range bake + job progress** · `codex/range-bake-jobs` · `e1458b6` — **CLEARED TO MERGE (owner's click)**
-  - Executed audit: 36/37 pass on Linux (real ffmpeg range bake w/ A/V sync, immutable per-job artifacts, SIGTERM-ignoring-child cancel, restart admission); offset fix + atomic publish read-verified.
-  - Codex's Windows discovery: os.kill(pid,0) is destructive on Windows — replaced with verified start-token probe.
-  - F1 (SEV-3, test-only): the Windows-liveness test errors on Python 3.10/3.11 (pathlib dispatch via patched os.name); passes on CI's 3.12. **Required: 3-line test fix as first commit of the PR #4 branch.**
+- ✅ **PR #4 — courier inbox + generate jobs** · `codex/courier-generate-jobs` · `d9b37ca` — **CLEARED TO MERGE** (owner says "merge PR #4" to Codex)
+  - Executed audit on the environment that surfaced F1: 38/38 pass incl. the 20-assertion courier lifecycle test; F1 fix verified (previously-erroring test now green on the same box).
+  - Settle window, stamp-dedupe, cancel-race re-check after conform, poison-file quarantine, provider interface per contract. Zero blocking findings.
+  - v1.1 notes: poller silent-exception surfacing; split the mega lifecycle test.
 
 ## Next up (not started)
 
-1. **Merge PR #3** (owner), then Codex starts PR #4: courier inbox + generate jobs (docs/V1-PLAN.md) — first commit = the F1 test fix.
+1. **Owner: tell Codex "merge PR #4"**, then Codex starts PR #5: VO project bootstrap (docs/V1-PLAN.md) — the final slice before first-video editing.
 2. Hyperframe generation + richer scene editing (typed Remotion props).
 3. Script-driven pipeline N1 (ingest) — see `docs/next-level/NEXT-LEVEL.md`.
 4. Sweep the deferred `cuts.json` save lock when the Cut workspace is next touched.
