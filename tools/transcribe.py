@@ -12,6 +12,7 @@ Writes: <project>/work/<outdir>/<id>.json  (full AssemblyAI response)
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -48,7 +49,13 @@ def load_keyterms(project: Path) -> list[str]:
 
 
 def load_env_key(repo_root: Path, name: str) -> str:
-    for line in (repo_root / ".env").read_text().splitlines():
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    env_file = repo_root / ".env"
+    if not env_file.is_file():
+        sys.exit(f"{name} is not set and {env_file} does not exist")
+    for line in env_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line.startswith(name + "="):
             value = line.split("=", 1)[1].strip().strip('"').strip("'")
@@ -126,7 +133,9 @@ def main() -> None:
             r.raise_for_status()
             data = r.json()
             if data["status"] == "completed":
-                (out_dir / f"{clip}.json").write_text(json.dumps(data, indent=1))
+                (out_dir / f"{clip}.json").write_text(
+                    json.dumps(data, indent=1), encoding="utf-8"
+                )
                 model = data.get("speech_model_used") or data.get("speech_model") or "?"
                 print(f"{clip}: completed, {len(data.get('words') or [])} words, model={model}")
                 del pending[clip]

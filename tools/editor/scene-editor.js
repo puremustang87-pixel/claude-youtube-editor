@@ -21,6 +21,7 @@
     importing: false,
     currentJob: null,
     jobPollTimer: null,
+    wordTicks: [],
   };
 
   const sceneVid = $("sceneVid");
@@ -398,6 +399,7 @@
       S.compositions = data.compositions || [];
       S.warnings = data.warnings || [];
       S.issues = data.issues || [];
+      S.wordTicks = data.word_ticks || [];
       sceneVid.src = `/media/master?token=${encodeURIComponent(window.workbenchToken || "")}`;
       sceneVid.load();
       const maxEnd = Math.max(0, ...(S.timeline.shots || []).map((shot) => num(shot.master_out_s)));
@@ -503,7 +505,7 @@
     if (!S.ready || !S.timeline) return;
     const width = Math.max(S.duration * S.pps, sceneTimeline.clientWidth || 0);
     sceneInner.style.width = `${width}px`;
-    sceneInner.querySelectorAll(".scene-block,.scene-tick,.scene-tick-label").forEach((node) => node.remove());
+    sceneInner.querySelectorAll(".scene-block,.scene-tick,.scene-tick-label,.scene-word-tick").forEach((node) => node.remove());
     const overlaps = overlappingIndexes();
     const step = S.pps >= 18 ? 5 : (S.pps >= 8 ? 10 : 30);
     for (let at = 0; at <= S.duration; at += step) {
@@ -519,6 +521,15 @@
         $("sceneRuler").appendChild(label);
       }
     }
+    S.wordTicks.forEach((word) => {
+      const at = num(word.start_s, -1);
+      if (at < 0 || at > S.duration) return;
+      const tick = document.createElement("div");
+      tick.className = "scene-word-tick";
+      tick.style.left = `${at * S.pps}px`;
+      tick.title = `${word.text || "word"} · ${fmt(at)}`;
+      $("sceneRuler").appendChild(tick);
+    });
     S.timeline.shots.forEach((shot, index) => {
       const block = document.createElement("div");
       block.className = `scene-block ${shot.type === "overlay" ? "overlay" : "cutaway"}`

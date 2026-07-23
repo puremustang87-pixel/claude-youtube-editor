@@ -398,6 +398,7 @@
 .scene-tick { position: absolute; top: 0; height: 6px; border-left: 1px solid #555e6e; }
 .scene-tick.major { height: 10px; border-color: #7e8798; }
 .scene-tick-label { position: absolute; top: 11px; transform: translateX(-50%); color: var(--dim); font-size: 9px; }
+.scene-word-tick { position: absolute; top: 22px; height: 10px; border-left: 1px solid rgba(99, 102, 241, .72); }
 #scenePlayhead { position: absolute; top: 20px; bottom: 0; z-index: 8; width: 1px; background: #fff; pointer-events: none; }
 
 @media (max-width: 1050px) {

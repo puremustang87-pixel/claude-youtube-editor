@@ -132,6 +132,7 @@ EDITOR_MANIFEST = PROJECT / "work" / "editor" / "manifest.json"
 TIMELINE = PROJECT / "work" / "timeline.json"
 JOBS_DIR = PROJECT / "work" / "jobs"
 INBOX_DIR = PROJECT / "work" / "inbox"
+EDITED_TRANSCRIPT = PROJECT / "work" / "edited-transcript.json"
 
 MEDIA = {
     "/media/proxy.mp4": (PROXY, "video/mp4"),
@@ -589,6 +590,29 @@ def timeline_snapshot() -> tuple[dict, str]:
         timeline = load_timeline()
         etag = timeline_etag()
     return timeline, etag
+
+
+def transcript_word_ticks(path: Path = EDITED_TRANSCRIPT) -> list[dict]:
+    """Return transcript word boundaries in the master clock for the scene ruler."""
+    document = read_json(path, {})
+    words = document.get("words") if isinstance(document, dict) else None
+    if not isinstance(words, list):
+        return []
+    ticks = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        try:
+            start_s = max(0.0, float(word["start"]) / 1000)
+            end_s = max(start_s, float(word.get("end", word["start"])) / 1000)
+        except (KeyError, TypeError, ValueError):
+            continue
+        ticks.append({
+            "text": str(word.get("text") or ""),
+            "start_s": round(start_s, 3),
+            "end_s": round(end_s, 3),
+        })
+    return ticks
 
 
 def take_immutability_errors(current: dict, proposed: dict) -> list[str]:
@@ -2235,12 +2259,13 @@ class Handler(BaseHTTPRequestHandler):
                 "project_path": str(PROJECT),
                 "timeline_path": str(TIMELINE),
                 "timeline_exists": TIMELINE.exists(),
-                "duration": project_duration(),
+                "duration": float(timeline.get("preview", {}).get("end_s") or project_duration()),
                 "timeline": timeline,
                 "etag": etag,
                 "compositions": catalog,
                 "issues": issues,
                 "warnings": warnings,
+                "word_ticks": transcript_word_ticks(),
             }, headers={"ETag": f'"{etag}"'})
         elif path == "/api/scenes/jobs":
             self.send_json(scene_jobs)
